@@ -213,4 +213,3 @@ public static class PdfStamper
             new(bold ? "stamp#b" : "stamp#r");
     }
 }
-

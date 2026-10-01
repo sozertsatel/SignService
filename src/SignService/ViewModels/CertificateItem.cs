@@ -58,4 +58,3 @@ public class CertificateItem
         + (IsExpired ? " (истёк)" : string.Empty)
         + (IsSaved ? " — сохранён на ПК 🔒" : string.Empty);
 }
-

@@ -49,4 +49,3 @@ public class CertificateProvider
         return string.IsNullOrWhiteSpace(cn) ? certificate.Issuer : cn;
     }
 }
-

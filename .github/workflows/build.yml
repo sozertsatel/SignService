@@ -64,5 +64,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: publish/SignService.exe
           body_path: CHANGELOG.md

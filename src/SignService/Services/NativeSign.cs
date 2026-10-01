@@ -202,4 +202,3 @@ internal static class NativeSign
         return new InvalidOperationException($"CryptSignMessage: {inner.Message} (0x{error:X8}).{hint}", inner);
     }
 }
-

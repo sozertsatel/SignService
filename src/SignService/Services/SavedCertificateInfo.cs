@@ -28,4 +28,3 @@ public class SavedCertificateInfo
     /// </summary>
     public string CertificateBase64 { get; set; } = "";
 }
-

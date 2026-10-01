@@ -54,4 +54,3 @@
                 Margin="0,12,0,0" MinWidth="100" Name="CloseButton"/>
     </Grid>
 </Window>
-

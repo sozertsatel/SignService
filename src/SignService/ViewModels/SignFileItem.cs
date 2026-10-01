@@ -104,4 +104,3 @@ public partial class SignFileItem : ObservableObject
         _ => $"{bytes / (1024.0 * 1024 * 1024):0.##} ГБ",
     };
 }
-
