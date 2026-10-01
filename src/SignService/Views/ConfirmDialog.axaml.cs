@@ -19,3 +19,4 @@ public partial class ConfirmDialog : Window
         NoButton.Click += (_, _) => Close(false);
     }
 }
+

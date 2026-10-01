@@ -60,3 +60,4 @@ public partial class PasswordDialog : Window
         ErrorText.IsVisible = true;
     }
 }
+

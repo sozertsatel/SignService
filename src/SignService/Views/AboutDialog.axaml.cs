@@ -124,3 +124,4 @@ public partial class AboutDialog : Window
         }
     }
 }
+

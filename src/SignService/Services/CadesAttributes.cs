@@ -79,3 +79,4 @@ internal static class CadesAttributes
             _ => (null, SHA256.HashData(certificate.RawData)),
         };
 }
+
