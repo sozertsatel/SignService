@@ -55,19 +55,34 @@ jobs:
           -p:EnableCompressionInSingleFile=true
           -o publish
 
+      # Архив релиза: exe, README.txt, CHANGELOG, LICENSE, лицензии компонентов,
+      # SHA-256 и описание релиза из CHANGELOG. Тег релиза обязан совпадать
+      # с версией проекта — иначе автообновление предлагало бы его бесконечно.
+      - name: Package release archive
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
+        run: ./.github/release/package.ps1 -PublishDir publish -OutputDir dist -Tag "$env:RELEASE_TAG"
+
       - uses: actions/upload-artifact@v4
         with:
           name: SignService-win-x64
-          path: publish/SignService.exe
+          path: |
+            dist/SignService-*-win-x64/
+            dist/SignService-*-win-x64.sha256
           if-no-files-found: error
 
       # Публикация GitHub Release: на тег v* либо по ручному запуску
       # с указанным release_tag (тег создаётся на текущем коммите).
+      # SignService.exe — отдельным файлом: его скачивает автообновление.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: publish/SignService.exe
-          body_path: CHANGELOG.md
+          files: |
+            publish/SignService.exe
+            dist/SignService-*-win-x64.zip
+            dist/SignService-*-win-x64.sha256
+          body_path: dist/RELEASE_NOTES.md

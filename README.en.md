@@ -45,22 +45,36 @@ is published on the [Releases](https://github.com/zaynullinmi/SignService/releas
   instead of duplicating it;
 - every merged signature is **cryptographically verified**, including the
   document digest, signature value and CAdES certificate binding. Damaged
-  signatures and signatures over another revision are excluded; unverifiable
-  signers are explicitly reported;
+  signatures and signatures over another revision are excluded; signers that
+  cannot be verified (unknown algorithm, missing certificate) are kept and
+  explicitly reported;
+- attaching another person's signature or switching the certificate puts an
+  already signed file back into the queue so it can be co-signed;
 - input signatures are accepted in DER/BER (including indefinite lengths and
   trailing bytes) and base64/PEM.
 
 ### Tools (no signature created)
 
+The operations are available in the **Tools** menu (pick files) and in the
+**context menu of a file** in the list (right click) — then the neighbouring
+`name.sig` is used.
+
 - **Verify signature…** — per-signer CMS/CAdES verification for GOST-2001,
   GOST-2012 256/512, RSA and ECDSA without CryptoPro. Select the original for
-  a detached signature; attached signatures use the embedded document.
+  a detached signature; attached signatures use the embedded document. From
+  the context menu ("Signers and verification…") verification starts at once.
   Copy or export the detailed report to TXT;
 - **Merge .sig…** — combine several signature files into one containing all
   signers (attached containers are accepted; the embedded document is kept);
 - **Extract from .sig…** — pull out of a container: the embedded document
   (byte-exact), a detached signature with all signers, and individual `.sig`
   files per signer (signer names in the file names);
+- **Split a group signature…** — a separate detached `.sig` per signer (the
+  embedded document is saved next to them);
+- **Remove a signer from .sig…** — pick the signer in a list (identical names
+  are told apart by the certificate serial number); a new file
+  `name (без подписанта).sig` is created, the source is left untouched and the
+  last signer cannot be removed;
 - **Build container…** — pack a document together with its existing
   signatures into an attached `.sig` (the inverse of extraction);
 - **Stamp PDF…** — save a stamped copy of a document without signing.
@@ -71,19 +85,29 @@ is published on the [Releases](https://github.com/zaynullinmi/SignService/releas
   (EMCHD_1 format) and the head's signature (.sig; a neighbouring
   `name.xml.sig` is picked up automatically);
 - the app verifies the head's signature using the certificate public key,
-  checks the validity period and matches the
-  representative in the MChD matches the selected certificate by INN/SNILS;
+  checks the MChD validity period and that the representative is the owner of
+  the selected certificate: the personal INN (12 digits) and SNILS are compared
+  when present on both sides; an organization INN in the certificate is never
+  compared with a personal INN;
+- a head certificate that expired after the MChD was issued does not reject
+  it — the certificate is checked as of the issue date and a warning is shown;
+  a certificate that expired before the issue date (or was not yet valid) is
+  an error;
 - when signing, the MChD files (XML + .sig) are copied next to the signed
   document (the MChD is NOT embedded into the CMS signature — Kontur does
   the same), and the visual PDF stamp gains a
   "Acting under power of attorney No. …" line;
-- the power of attorney is remembered and re-validated on every signing.
+- the power of attorney is remembered and re-validated in the background at
+  startup and once before every signing batch.
 
 ### Visual stamp on PDF
 
-- a "DOCUMENT SIGNED WITH ELECTRONIC SIGNATURE" box on the last page:
-  certificate number, owner, validity period, optionally the signing date and
-  an **organization logo** (PNG/JPEG);
+- a "DOCUMENT SIGNED WITH ELECTRONIC SIGNATURE" box: certificate number, owner,
+  validity period, optionally the signing date and an **organization logo**
+  (PNG/JPEG);
+- the parameters are chosen in a dialog before the operation: pages (first,
+  last, all or a list such as "1,3-5"), date, logo; every selected page gets
+  a **separate box per signer**;
 - by default the **original** file is signed, and the stamped copy
   `name (stamped).pdf` is a separate **unsigned** file recreated after every
   signing with **all signers** of the resulting signature (safe for
@@ -108,10 +132,13 @@ is published on the [Releases](https://github.com/zaynullinmi/SignService/releas
 
 ### Miscellaneous
 
-- an **operation log window** with timestamps;
+- the **operation log** is always visible in the main window, with timestamps;
+- a **Settings window**: timestamp (CAdES-T) and the TSA URL;
 - an **About window**: version, author contacts, changelog, update check;
 - **auto-update**: new releases are checked on GitHub Releases at startup
-  (can be disabled) and installed in one click from the About window (Windows).
+  (can be disabled) and installed in one click from the About window (Windows);
+  the previous exe is kept as a backup and restored if the new version fails
+  to start.
 
 ### Trust, revocation and timestamps
 
@@ -121,7 +148,9 @@ trust: anchors come from OS root stores and explicitly selected CA certificates.
 BouncyCastle verifies certificate-chain, CRL and OCSP signatures without a CSP.
 
 Verification is offline by default. It uses embedded CRLs and selected `.crl`/
-`.ocsp` files; HTTP(S) CRL/OCSP requests require the network checkbox. Revocation
+`.ocsp` files; HTTP(S) CRL/OCSP requests require the network checkbox (the
+setting is remembered and also applies to MChD checks). An unavailable trusted
+root file is skipped with a warning. Revocation
 is checked for every chain certificate except the trust anchor. Missing, stale,
 unverifiable or partial evidence (including delta/indirect CRLs) gives an unknown
 status. Missing intermediate certificates must be embedded in the CMS or in OS
@@ -132,8 +161,10 @@ Historical certificate validity is assessed only using a TSA timestamp whose
 imprint, signature, trust and required revocation checks passed. TSA responses
 also must match the request and nonce.
 
-MChD verification re-reads current files, verifies and copies the same XML/SIG
-snapshot. Conflicting destination files stop signing before the signature is
+MChD verification re-reads current files before a signing batch, verifies and
+copies the same XML/SIG snapshot. If the head certificate expired after the MChD
+was issued and there is no TSA timestamp, the signing time is not proven — the app
+warns and checks the certificate as of the issue date. Conflicting destination files stop signing before the signature is
 saved. Cryptographic verification does not establish the head's authority,
 the scope of delegated powers or MChD registry revocation; missing assurances
 are reported as warnings.
@@ -158,8 +189,9 @@ dotnet run --project tests/SignService.Tests -c Release   # tests
 
 On a personal workstation append `-- --skip-user-store` to the test command to
 skip scenarios that change user certificate stores or application data. CI runs
-the full suite in an isolated runner. Managed GOST, CRL/OCSP and TSA verification
-tests run without CryptoPro or OpenSSL.
+the full suite in isolated Linux and Windows runners. Managed GOST, CRL/OCSP and
+TSA verification tests run without CryptoPro or OpenSSL; the UI is smoke-tested
+without a display (Avalonia.Headless).
 
 Publishing the self-contained exe:
 
@@ -174,11 +206,12 @@ dotnet publish src/SignService -c Release -r win-x64 --self-contained true \
 ## Usage
 
 1. Start the app — certificates with a private key appear in the drop-down.
-2. Pick a certificate and the signature mode; optionally enable the timestamp
-   and/or the PDF stamp.
+2. Pick a certificate and the signature mode; optionally enable the PDF stamp
+   (a dialog asks for its parameters); the timestamp is set up in **Settings…**.
 3. Drag files into the window (or use the browser) and press **Sign** —
    a `name.sig` appears next to each file.
-4. Operations on existing signatures live in the **Tools** menu.
+4. Operations on existing signatures live in the **Tools** menu and in the
+   file context menu (right click); progress is shown in the log.
 
 The change history is in [CHANGELOG.md](CHANGELOG.md) (Russian) and in the
 About window.
@@ -202,14 +235,20 @@ src/SignService/
 │   ├── CadesAttributes.cs       # CAdES-BES attributes: signing-time, signing-cert-v2
 │   ├── Streebog.cs              # GOST R 34.11-2012 for certHash (RFC 6986 vectors)
 │   ├── CmsMerger.cs             # ASN.1-level merge/split/build of signatures
-│   ├── CmsExtractor.cs          # file operations: extract, merge, container
+│   ├── CmsExtractor.cs          # file operations: extract, merge, split, container
+│   ├── SignatureVerifier.cs     # per-signer verification (BouncyCastle, GOST without a CSP)
+│   ├── CertificateValidator.cs  # trust chain (PKIX) and OS stores
+│   ├── RevocationChecker.cs     # certificate revocation: CRL and OCSP
+│   ├── PowerOfAttorneyService.cs # MChD: EMCHD_1 parsing, checks, copying
 │   ├── BerDer.cs                # BER → definite-length normalization
+│   ├── AtomicFile.cs            # file writes through a temporary file
 │   ├── CertificateVault.cs      # certificate on disk: PFX and Windows store
 │   ├── TimestampClient.cs       # RFC 3161 TSA client for CAdES-T
-│   ├── PdfStamper.cs            # visual PDF stamp (details, date, logo)
+│   ├── PdfStamper.cs            # visual PDF stamp (pages, signers, logo)
 │   ├── UpdateService.cs         # auto-update via GitHub Releases
-│   └── AppSettings.cs           # settings (certificate, modes, stamps)
+│   └── AppSettings.cs           # settings (certificate, modes, stamps, trust)
 ├── ViewModels/                  # MVVM: main window, files, certificates
-└── Views/                       # windows: main, password, confirm, about
-tests/SignService.Tests/         # integration tests (run in CI)
+└── Views/                       # windows: main, verification, stamp, signers, settings…
+tests/SignService.Tests/         # integration tests and UI smoke test (CI: Linux and Windows)
+.github/release/                 # release archive packaging: script and license texts
 ```
