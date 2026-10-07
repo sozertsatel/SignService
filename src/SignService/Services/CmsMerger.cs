@@ -229,6 +229,50 @@ internal static class CmsMerger
     }
 
     /// <summary>
+    /// Подписант контейнера: Id — DER SignerIdentifier в hex (устойчив при
+    /// одинаковых ФИО), CertificateId — серийный номер сертификата (или SKI).
+    /// </summary>
+    public sealed record SignerDescriptor(string Id, string Name, string CertificateId);
+
+    public static IReadOnlyList<SignerDescriptor> GetSigners(byte[] signature)
+    {
+        var parsed = Parse(Normalize(signature));
+        var index = BuildCertIndex(new List<ParsedSignedData> { parsed });
+        return parsed.Signers.Select(s =>
+        {
+            var reader = new AsnReader(Convert.FromHexString(s.SidKey), AsnEncodingRules.BER);
+            string identifier;
+            if (reader.PeekTag().TagClass == TagClass.Universal)
+            {
+                var sid = reader.ReadSequence();
+                sid.ReadEncodedValue();                                    // issuer
+                identifier = Convert.ToHexString(sid.ReadIntegerBytes().Span);
+            }
+            else
+            {
+                identifier = s.SidKey;                                     // [0] subjectKeyIdentifier
+            }
+
+            return new SignerDescriptor(s.SidKey, SignerDisplayName(s.Der, index), identifier);
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Удаляет SignerInfo по идентификатору (см. <see cref="GetSigners"/>), сохраняя
+    /// документ, сертификаты и остальных подписантов. Последнего подписанта удалить нельзя.
+    /// </summary>
+    public static byte[] RemoveSigner(byte[] signature, string signerId)
+    {
+        var parsed = Parse(Normalize(signature));
+        if (!parsed.Signers.Any(s => s.SidKey == signerId))
+            throw new InvalidOperationException("Выбранного подписанта нет в этом файле подписи.");
+        parsed.Signers.RemoveAll(s => s.SidKey == signerId);
+        if (parsed.Signers.Count == 0)
+            throw new InvalidOperationException("Нельзя исключить последнего подписанта: подпись станет пустой.");
+        return BuildMerged(new List<ParsedSignedData> { parsed });
+    }
+
+    /// <summary>
     /// Извлекает вложенный документ из прикреплённой подписи;
     /// null — если подпись откреплённая (документа внутри нет).
     /// </summary>

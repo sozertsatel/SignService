@@ -477,8 +477,11 @@ catch (ArgumentException)
 // ===== 13. Хранилище сертификатов на компьютере (PFX с паролем) =====
 if (!args.Contains("--skip-user-store"))
 {
-var vault = new CertificateVault();
-var vaultSettings = new AppSettings(); // пишет в реальный %AppData% — тестовые записи чистим ниже
+// PFX и настройки — во временной папке; системное хранилище (Личное) затрагивается
+// только установкой/удалением ниже, поэтому раздел можно пропустить флагом.
+var vaultDir = Path.Combine(tempRoot, "certificates");
+var vault = new CertificateVault(vaultDir);
+var vaultSettings = new AppSettings(Path.Combine(tempRoot, "settings"));
 
 var savedInfo = vault.Save(cert, "test-пароль-123", vaultSettings);
 if (savedInfo.Thumbprint != cert.Thumbprint || savedInfo.Subject != "Тестовый Пользователь")
@@ -564,9 +567,7 @@ catch (InvalidOperationException e) when (e.Message.Contains("не был уст
 }
 
 // удаление: файл затёрт и удалён, запись убрана
-var pfxPath = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-    "SignService", "certificates", savedInfo.FileName);
+var pfxPath = Path.Combine(vaultDir, savedInfo.FileName);
 if (!File.Exists(pfxPath)) throw new Exception("pfx file missing before delete");
 vault.Delete(savedInfo, vaultSettings);
 if (File.Exists(pfxPath)) throw new Exception("pfx file must be deleted");
@@ -793,6 +794,7 @@ if (!vText.Contains("Подписантов: 2") || !vText.Contains("Докум�
 Console.WriteLine("verify: text report format: OK");
 
 await VerificationTests.RunAsync(tempRoot);
+await ReviewRegressionTests.RunAsync(tempRoot, signer);
 try { Directory.Delete(tempRoot, true); } catch { }
 Console.WriteLine("ALL TESTS PASSED");
 return 0;

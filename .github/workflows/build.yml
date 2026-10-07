@@ -42,6 +42,10 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      # Windows-ветки: CryptoAPI-подпись, хранилище сертификатов, помощник автообновления.
+      - name: Run Windows test suite (CryptoAPI and update rollback)
+        run: dotnet run --project tests/SignService.Tests -c Release
+
       - name: Publish self-contained single-file exe
         run: >
           dotnet publish src/SignService -c Release -r win-x64

@@ -13,15 +13,27 @@ public partial class MainWindowViewModel : ObservableObject
 {
     private readonly CertificateProvider _certificateProvider;
     private readonly DocumentSigner _documentSigner;
-    private readonly CertificateVault _vault = new();
+    private readonly CertificateVault _vault;
     private readonly AppSettings _settings;
     private bool _initializing;
 
+    // Отпечаток выбранного сертификата: список пересоздаёт элементы при обновлении,
+    // поэтому смену сертификата определяем по отпечатку, а не по экземпляру.
+    private string? _activeThumbprint;
+
     public MainWindowViewModel(CertificateProvider certificateProvider, DocumentSigner documentSigner)
+        : this(certificateProvider, documentSigner, AppSettings.Load())
+    {
+    }
+
+    /// <summary>С явными настройками и папкой сохранённых сертификатов — для тестов.</summary>
+    public MainWindowViewModel(CertificateProvider certificateProvider, DocumentSigner documentSigner,
+        AppSettings settings, CertificateVault? vault = null)
     {
         _certificateProvider = certificateProvider;
         _documentSigner = documentSigner;
-        _settings = AppSettings.Load();
+        _settings = settings;
+        _vault = vault ?? new CertificateVault();
 
         _initializing = true;
         IsDetached = _settings.DetachedSignature;
@@ -155,6 +167,14 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(MergeFilesCommand))]
     [NotifyCanExecuteChangedFor(nameof(BuildContainerCommand))]
     [NotifyCanExecuteChangedFor(nameof(VerifySignatureCommand))]
+    [NotifyCanExecuteChangedFor(nameof(SplitSignaturesCommand))]
+    [NotifyCanExecuteChangedFor(nameof(RemoveSignerCommand))]
+    [NotifyCanExecuteChangedFor(nameof(AttachSignaturesCommand))]
+    [NotifyCanExecuteChangedFor(nameof(StampItemCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ExtractItemCommand))]
+    [NotifyCanExecuteChangedFor(nameof(BuildContainerItemCommand))]
+    [NotifyCanExecuteChangedFor(nameof(SplitItemCommand))]
+    [NotifyCanExecuteChangedFor(nameof(RemoveSignerItemCommand))]
     private bool _isBusy;
 
     [ObservableProperty]
@@ -204,6 +224,15 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>Запрос диалога выбора документа для сборки криптоконтейнера.</summary>
     public event EventHandler? BuildContainerRequested;
 
+    /// <summary>Запрос диалога выбора групповых подписей для разделения.</summary>
+    public event EventHandler? SplitSignaturesRequested;
+
+    /// <summary>Запрос диалога выбора подписи, из которой исключается подписант.</summary>
+    public event EventHandler? RemoveSignerRequested;
+
+    /// <summary>Выбор исключаемого подписанта (реализуется окном): Id или null при отмене.</summary>
+    public Func<IReadOnlyList<CmsExtractor.SignerInfo>, Task<string?>>? RequestSignerChoiceAsync { get; set; }
+
     /// <summary>
     /// Открыть окно «Проверка ЭЦП» (реализуется окном). Пути подписи и документа
     /// необязательны: если подпись указана, проверка запускается сразу.
@@ -227,7 +256,28 @@ public partial class MainWindowViewModel : ObservableObject
     // сертификатом без повторного выбора.
     partial void OnSelectedCertificateChanged(CertificateItem? value)
     {
-        if (_initializing || value is null)
+        if (value is null)
+            return;
+
+        // Смена сертификата позволяет соподписать уже обработанные файлы. Обновление
+        // списка (тот же отпечаток, новый элемент) статусы не сбрасывает.
+        var changed = _activeThumbprint is not null
+            && !string.Equals(_activeThumbprint, value.Thumbprint, StringComparison.OrdinalIgnoreCase);
+        _activeThumbprint = value.Thumbprint;
+        if (changed)
+        {
+            var requeued = 0;
+            foreach (var file in Files.Where(f => f.Status == SignStatus.Signed))
+            {
+                file.ResetForSigning();
+                requeued++;
+            }
+
+            if (requeued > 0)
+                Log($"Сертификат сменён: подписанные файлы ({requeued}) снова в очереди — для соподписания.");
+        }
+
+        if (_initializing)
             return;
         _settings.SignCertThumbprint = value.Thumbprint;
         _settings.Save();
@@ -665,7 +715,7 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>Открыть диалог выбора подписей других лиц для файла.</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
     private void AttachSignatures(SignFileItem item) => AttachSignaturesRequested?.Invoke(this, item);
 
     [RelayCommand(CanExecute = nameof(CanBrowse))]
@@ -817,7 +867,7 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>ПКМ: штамп для файла из списка (диалог параметров → копия без подписи).</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
     private async Task StampItemAsync(SignFileItem item)
     {
         if (RequestStampOptionsAsync is null)
@@ -830,7 +880,7 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>ПКМ: извлечь из контейнера «имя.sig» рядом с файлом.</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
     private async Task ExtractItemAsync(SignFileItem item)
     {
         var sigPath = item.FilePath + ".sig";
@@ -844,9 +894,122 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>ПКМ: собрать криптоконтейнер из файла и его подписи рядом.</summary>
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
     private Task BuildContainerItemAsync(SignFileItem item) =>
         BuildContainerAsync(item.FilePath, null);
+
+    /// <summary>ПКМ: разделить групповую подпись «имя.sig» рядом с файлом по подписантам.</summary>
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
+    private async Task SplitItemAsync(SignFileItem item)
+    {
+        var sigPath = item.FilePath + ".sig";
+        if (!System.IO.File.Exists(sigPath))
+        {
+            StatusText = $"Рядом с «{item.FileName}» нет файла подписи для разделения.";
+            return;
+        }
+
+        await SplitSignatureFilesAsync(new[] { sigPath });
+    }
+
+    /// <summary>ПКМ: исключить подписанта из «имя.sig» рядом с файлом.</summary>
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
+    private async Task RemoveSignerItemAsync(SignFileItem item)
+    {
+        var sigPath = item.FilePath + ".sig";
+        if (!System.IO.File.Exists(sigPath))
+        {
+            StatusText = $"Рядом с «{item.FileName}» нет файла подписи.";
+            return;
+        }
+
+        await RemoveSignerFromFileAsync(sigPath);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
+    private void SplitSignatures() => SplitSignaturesRequested?.Invoke(this, EventArgs.Empty);
+
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
+    private void RemoveSigner() => RemoveSignerRequested?.Invoke(this, EventArgs.Empty);
+
+    /// <summary>Разделяет групповые подписи на отдельные .sig по подписантам.</summary>
+    public async Task SplitSignatureFilesAsync(IReadOnlyList<string> paths)
+    {
+        if (paths.Count == 0)
+            return;
+
+        IsBusy = true;
+        try
+        {
+            foreach (var path in paths)
+            {
+                var name = System.IO.Path.GetFileName(path);
+                try
+                {
+                    var r = await Task.Run(() => CmsExtractor.SplitSignatureFile(path));
+                    StatusText = $"«{name}»: создано отдельных подписей: {r.SignerFiles.Count} ("
+                        + string.Join(", ", r.SignerFiles.Select(System.IO.Path.GetFileName)) + ")"
+                        + (r.DocumentPath is null ? "" : $"; документ → {System.IO.Path.GetFileName(r.DocumentPath)}");
+                }
+                catch (Exception ex)
+                {
+                    StatusText = $"Разделение «{name}»: {ex.Message}";
+                }
+            }
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// Исключает подписанта: выбор в диалоге → новый файл «имя (без подписанта).sig»
+    /// с остальными подписями. Исходный файл не меняется.
+    /// </summary>
+    public async Task RemoveSignerFromFileAsync(string path)
+    {
+        if (RequestSignerChoiceAsync is null)
+            return;
+
+        var name = System.IO.Path.GetFileName(path);
+        IReadOnlyList<CmsExtractor.SignerInfo> signers;
+        try
+        {
+            signers = await Task.Run(() => CmsExtractor.ListSigners(path));
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Не удалось прочитать подпись «{name}»: {ex.Message}";
+            return;
+        }
+
+        if (signers.Count < 2)
+        {
+            StatusText = $"«{name}»: подписант один — последнего подписанта исключить нельзя.";
+            return;
+        }
+
+        var signerId = await RequestSignerChoiceAsync(signers);
+        if (signerId is null)
+            return;
+
+        IsBusy = true;
+        try
+        {
+            var r = await Task.Run(() => CmsExtractor.RemoveSignerFromFile(path, signerId));
+            StatusText = $"Подписант исключён → «{System.IO.Path.GetFileName(r.OutputPath)}», "
+                + $"осталось подписантов: {r.SignerCount}. Исходный «{name}» не изменён.";
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Не удалось исключить подписанта: " + ex.Message;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
 
     /// <summary>ПКМ: открыть папку файла.</summary>
     [RelayCommand]
@@ -1023,7 +1186,7 @@ public partial class MainWindowViewModel : ObservableObject
                     {
                         Detached = IsDetached,
                         MergeWithExisting = MergeWithExisting,
-                        ExtraSignatures = file.ExtraSignatures,
+                        ExtraSignatures = file.ExtraSignatures.ToList(),
                         Timestamp = UseTimestamp,
                         TsaUrl = TsaUrl,
                         Stamp = UseStamp,

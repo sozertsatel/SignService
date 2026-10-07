@@ -13,6 +13,41 @@ namespace SignService.Services;
 /// </summary>
 public static class CmsExtractor
 {
+    public sealed record SignerInfo(string Id, string DisplayName);
+
+    public sealed record RemoveSignerResult(string OutputPath, int SignerCount);
+
+    /// <summary>Подписанты файла подписи — для выбора исключаемого.</summary>
+    public static IReadOnlyList<SignerInfo> ListSigners(string signaturePath) =>
+        CmsMerger.GetSigners(File.ReadAllBytes(signaturePath))
+            .Select((s, index) => new SignerInfo(s.Id, $"{index + 1}. {s.Name} — сертификат {s.CertificateId}"))
+            .ToList();
+
+    /// <summary>
+    /// Разделяет групповую подпись на отдельные откреплённые .sig по подписантам;
+    /// вложенный документ прикреплённого контейнера сохраняется рядом.
+    /// </summary>
+    public static ExtractionResult SplitSignatureFile(string signaturePath)
+    {
+        if (CmsMerger.CountSigners(File.ReadAllBytes(signaturePath)) < 2)
+            throw new InvalidOperationException("В файле меньше двух подписантов — это не групповая подпись.");
+        return ExtractToFiles(signaturePath);
+    }
+
+    /// <summary>
+    /// Создаёт рядом новый файл «имя (без подписанта).sig» без выбранного подписанта.
+    /// Исходный файл не меняется.
+    /// </summary>
+    public static RemoveSignerResult RemoveSignerFromFile(string signaturePath, string signerId)
+    {
+        var signature = CmsMerger.RemoveSigner(File.ReadAllBytes(signaturePath), signerId);
+        var directory = Path.GetDirectoryName(signaturePath) ?? ".";
+        var output = UniquePath(directory,
+            Path.GetFileNameWithoutExtension(signaturePath) + " (без подписанта).sig", new[] { signaturePath });
+        AtomicFile.Write(output, signature);
+        return new RemoveSignerResult(output, CmsMerger.CountSigners(signature));
+    }
+
     public sealed record ExtractionResult(
         string ContainerName,
         bool WasAttached,

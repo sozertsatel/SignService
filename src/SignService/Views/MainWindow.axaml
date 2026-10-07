@@ -152,6 +152,12 @@
                                             <MenuItem Header="Собрать контейнер (документ + .sig рядом)"
                                                       Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).BuildContainerItemCommand}"
                                                       CommandParameter="{Binding}"/>
+                                            <MenuItem Header="Разделить групповую подпись (.sig рядом)"
+                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).SplitItemCommand}"
+                                                      CommandParameter="{Binding}"/>
+                                            <MenuItem Header="Исключить подписанта из .sig…"
+                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).RemoveSignerItemCommand}"
+                                                      CommandParameter="{Binding}"/>
                                             <Separator/>
                                             <MenuItem Header="Открыть папку файла"
                                                       Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).OpenFolderCommand}"
@@ -216,6 +222,10 @@
                                   Command="{Binding ExtractCommand}"/>
                         <MenuItem Header="Объединить .sig… (несколько подписей в одну)"
                                   Command="{Binding MergeFilesCommand}"/>
+                        <MenuItem Header="Разделить групповую подпись… (отдельная .sig для каждого)"
+                                  Command="{Binding SplitSignaturesCommand}"/>
+                        <MenuItem Header="Исключить подписанта из .sig…"
+                                  Command="{Binding RemoveSignerCommand}"/>
                         <MenuItem Header="Собрать контейнер… (документ + подписи в один .sig)"
                                   Command="{Binding BuildContainerCommand}"/>
                         <MenuItem Header="Штамп на PDF… (копия со штампом без подписания)"
