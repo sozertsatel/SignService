@@ -203,6 +203,11 @@ public class UpdateService
                     }
                     catch {
                         if ([DateTime]::UtcNow -ge $replaceDeadline) { throw }
+                        # Неудачная попытка могла оставить копию прежнего EXE под именем резервной.
+                        if ([IO.File]::Exists($backup) -and [IO.File]::Exists($config.current)) {
+                            try { [IO.File]::Delete($backup) }
+                            catch { $backup = $config.current + '.' + [Guid]::NewGuid().ToString('N') + '.bak' }
+                        }
                         Start-Sleep -Milliseconds 250
                     }
                 }
@@ -225,6 +230,10 @@ public class UpdateService
                 elseif (-not [IO.File]::Exists($config.current) -and [IO.File]::Exists($backup)) {
                     try { [IO.File]::Move($backup, $config.current) }
                     catch { $failure += '; restore failed: ' + $_.Exception.Message + '; backup: ' + $backup }
+                }
+                elseif ([IO.File]::Exists($backup)) {
+                    # Замена не состоялась, прежний EXE на месте — лишняя копия не нужна.
+                    try { [IO.File]::Delete($backup) } catch { }
                 }
                 try { [IO.File]::WriteAllText($log, $failure) } catch { }
                 if ($config.restart -and $parentExited -and [IO.File]::Exists($config.current)) {

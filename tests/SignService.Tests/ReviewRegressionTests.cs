@@ -358,6 +358,7 @@ internal static class ReviewRegressionTests
         using (new FileStream(current, FileMode.Open, FileAccess.Read, FileShare.Read))
             Assert(await Run() != 0, "locked executable must fail safely after the retry window");
         Assert(File.ReadAllText(current) == "working old version", "failed replacement destroyed executable");
+        Assert(Directory.GetFiles(dir, "*.bak").Length == 0, "failed replacement must not leave backup copies");
 
         // Файл освобождается во время ожидания (процесс ещё завершался) — замена повторяется и проходит.
         Process pending;
