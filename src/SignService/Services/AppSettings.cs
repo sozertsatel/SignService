@@ -17,6 +17,18 @@ public class AppSettings
 
     private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
 
+    private readonly string _settingsDirectory = SettingsDir;
+    private readonly string _settingsPath = SettingsPath;
+
+    public AppSettings() { }
+
+    /// <summary>Изолированное хранилище настроек (например, для интеграционных тестов).</summary>
+    public AppSettings(string settingsDirectory)
+    {
+        _settingsDirectory = Path.GetFullPath(settingsDirectory);
+        _settingsPath = Path.Combine(_settingsDirectory, "settings.json");
+    }
+
     /// <summary>Отпечаток сертификата подписи по умолчанию.</summary>
     public string? SignCertThumbprint { get; set; }
 
@@ -45,6 +57,12 @@ public class AppSettings
     /// </summary>
     public bool StampSignCopy { get; set; }
 
+    /// <summary>Режим страниц штампа (Last/First/All/Custom).</summary>
+    public string StampPagesMode { get; set; } = "Last";
+
+    /// <summary>Номера страниц для режима Custom («1,3-5»).</summary>
+    public string? StampCustomPages { get; set; }
+
     /// <summary>Путь к логотипу организации для штампа (PNG/JPEG).</summary>
     public string? StampLogoPath { get; set; }
 
@@ -66,6 +84,37 @@ public class AppSettings
     /// <summary>Путь к подписи руководителя (.sig) для МЧД.</summary>
     public string? PoaSigPath { get; set; }
 
+    /// <summary>Дополнительные явно доверенные корни; хранилище ОС не изменяется.</summary>
+    public List<string> VerificationTrustedRootPaths { get; set; } = new();
+
+    /// <summary>Разрешение запросов CRL/OCSP при проверке ЭЦП.</summary>
+    public bool VerificationAllowNetwork { get; set; }
+
+    /// <summary>
+    /// Параметры проверки ЭЦП из настроек: дополнительные доверенные корни и разрешение
+    /// сетевых запросов CRL/OCSP. Недоступный или повреждённый файл корня пропускается,
+    /// а описание добавляется в <paramref name="problems"/> — проверка не прерывается.
+    /// </summary>
+    public VerificationOptions CreateVerificationOptions(ICollection<string>? problems = null)
+    {
+        var roots = new List<byte[]>();
+        foreach (var path in VerificationTrustedRootPaths)
+        {
+            try
+            {
+                var certificate = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(File.ReadAllBytes(path))
+                    ?? throw new InvalidDataException("в файле нет сертификата");
+                roots.Add(certificate.GetEncoded());
+            }
+            catch (Exception e)
+            {
+                problems?.Add($"Доверенный корень «{path}» пропущен: {e.Message}");
+            }
+        }
+
+        return new VerificationOptions { TrustedRoots = roots, AllowNetwork = VerificationAllowNetwork };
+    }
+
     public static AppSettings Load()
     {
         try
@@ -85,8 +134,8 @@ public class AppSettings
     {
         try
         {
-            Directory.CreateDirectory(SettingsDir);
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+            Directory.CreateDirectory(_settingsDirectory);
+            File.WriteAllText(_settingsPath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch
         {

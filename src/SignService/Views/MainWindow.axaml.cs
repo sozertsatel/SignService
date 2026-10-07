@@ -26,6 +26,12 @@ public partial class MainWindow : Window
             await new AboutDialog(settings).ShowDialog(this);
         };
 
+        SettingsButton.Click += async (_, _) =>
+        {
+            if (DataContext is MainWindowViewModel vm)
+                await new SettingsDialog(vm).ShowDialog(this);
+        };
+
         DataContextChanged += (_, _) =>
         {
             if (DataContext is MainWindowViewModel vm)
@@ -38,6 +44,19 @@ public partial class MainWindow : Window
                 vm.StampOnlyRequested += async (_, _) => await BrowseStampOnlyAsync(vm);
                 vm.BuildContainerRequested += async (_, _) => await BrowseBuildContainerAsync(vm);
                 vm.AddPoaRequested += async (_, _) => await BrowsePoaAsync(vm);
+                vm.SplitSignaturesRequested += async (_, _) => await BrowseSplitSignaturesAsync(vm);
+                vm.RemoveSignerRequested += async (_, _) => await BrowseRemoveSignerAsync(vm);
+                vm.RequestSignerChoiceAsync = async signers =>
+                    await new SignerDialog(signers).ShowDialog<string?>(this);
+                vm.RequestStampOptionsAsync = async showSignCopy =>
+                    await new StampOptionsDialog(vm.BuildInitialStampOptions(), vm.StampSignCopy, showSignCopy)
+                        .ShowDialog<StampOptionsDialog.Result?>(this);
+                vm.ShowVerificationAsync = async (signaturePath, documentPath) =>
+                {
+                    var dialog = new VerificationDialog(vm.Settings, signaturePath, documentPath);
+                    await dialog.ShowDialog(this);
+                    return dialog.LastSummary;
+                };
                 vm.PropertyChanged += (_, args) =>
                 {
                     // автопрокрутка лога вниз
@@ -198,11 +217,21 @@ public partial class MainWindow : Window
             },
         });
 
-        await vm.StampWithoutSigningAsync(files
+        var paths = files
             .Select(f => f.TryGetLocalPath())
             .Where(p => p is not null)
             .Select(p => p!)
-            .ToList());
+            .ToList();
+        if (paths.Count == 0)
+            return;
+
+        var options = await new StampOptionsDialog(vm.BuildInitialStampOptions(), vm.StampSignCopy, showSignCopy: false)
+            .ShowDialog<StampOptionsDialog.Result?>(this);
+        if (options is null)
+            return;
+
+        vm.SaveStampOptions(options);
+        await vm.StampWithoutSigningAsync(paths, options.Options);
     }
 
     private async System.Threading.Tasks.Task BrowsePoaAsync(MainWindowViewModel vm)
@@ -242,7 +271,7 @@ public partial class MainWindow : Window
                 return;
         }
 
-        vm.SetPoa(xmlPath, sigPath);
+        await vm.SetPoaAsync(xmlPath, sigPath);
     }
 
     private async System.Threading.Tasks.Task BrowseBuildContainerAsync(MainWindowViewModel vm)
@@ -305,5 +334,49 @@ public partial class MainWindow : Window
             .Where(p => p is not null)
             .Select(p => p!)
             .ToList());
+    }
+
+    private async System.Threading.Tasks.Task BrowseSplitSignaturesAsync(MainWindowViewModel vm)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Групповые подписи для разделения по подписантам",
+            AllowMultiple = true,
+            FileTypeFilter = new[]
+            {
+                new FilePickerFileType("Подписи CMS (*.sig, *.p7s, *.p7m)")
+                {
+                    Patterns = new[] { "*.sig", "*.p7s", "*.p7m" },
+                },
+                FilePickerFileTypes.All,
+            },
+        });
+
+        await vm.SplitSignatureFilesAsync(files
+            .Select(f => f.TryGetLocalPath())
+            .Where(p => p is not null)
+            .Select(p => p!)
+            .ToList());
+    }
+
+    private async System.Threading.Tasks.Task BrowseRemoveSignerAsync(MainWindowViewModel vm)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Подпись, из которой нужно исключить подписанта",
+            AllowMultiple = false,
+            FileTypeFilter = new[]
+            {
+                new FilePickerFileType("Подписи CMS (*.sig, *.p7s, *.p7m)")
+                {
+                    Patterns = new[] { "*.sig", "*.p7s", "*.p7m" },
+                },
+                FilePickerFileTypes.All,
+            },
+        });
+
+        var path = files.FirstOrDefault()?.TryGetLocalPath();
+        if (path is not null)
+            await vm.RemoveSignerFromFileAsync(path);
     }
 }

@@ -20,9 +20,18 @@ namespace SignService.Services;
 /// </summary>
 public class CertificateVault
 {
-    private static readonly string VaultDir = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "SignService", "certificates");
+    private readonly string _vaultDirectory;
+
+    /// <param name="vaultDirectory">Папка PFX; null — %AppData%/SignService/certificates
+    /// (другая папка — для изолированных интеграционных тестов).</param>
+    public CertificateVault(string? vaultDirectory = null)
+    {
+        _vaultDirectory = vaultDirectory is not null
+            ? Path.GetFullPath(vaultDirectory)
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "SignService", "certificates");
+    }
 
     /// <summary>
     /// Сохраняет сертификат с закрытым ключом в защищённый паролем PFX.
@@ -47,9 +56,9 @@ public class CertificateVault
                 + "Сохранить такой сертификат на компьютер нельзя.", e);
         }
 
-        Directory.CreateDirectory(VaultDir);
+        Directory.CreateDirectory(_vaultDirectory);
         var fileName = certificate.Thumbprint + ".pfx";
-        File.WriteAllBytes(Path.Combine(VaultDir, fileName), pfx);
+        File.WriteAllBytes(Path.Combine(_vaultDirectory, fileName), pfx);
 
         var info = new SavedCertificateInfo
         {
@@ -72,7 +81,7 @@ public class CertificateVault
     /// <summary>Сохранённые сертификаты, PFX-файлы которых существуют на диске.</summary>
     public IReadOnlyList<SavedCertificateInfo> List(AppSettings settings) =>
         settings.SavedCertificates
-            .Where(c => File.Exists(Path.Combine(VaultDir, c.FileName)))
+            .Where(c => File.Exists(Path.Combine(_vaultDirectory, c.FileName)))
             .ToList();
 
     /// <summary>Открытая часть сохранённого сертификата (без ключа и без пароля).</summary>
@@ -85,7 +94,7 @@ public class CertificateVault
     /// </summary>
     public X509Certificate2 Load(SavedCertificateInfo info, string password)
     {
-        var path = Path.Combine(VaultDir, info.FileName);
+        var path = Path.Combine(_vaultDirectory, info.FileName);
         if (!File.Exists(path))
             throw new InvalidOperationException("Файл сохранённого сертификата не найден: " + path);
 
@@ -169,7 +178,7 @@ public class CertificateVault
     /// <summary>Загрузка PFX с флагами для установки в хранилище (ключ сохраняется).</summary>
     private X509Certificate2 LoadForStore(SavedCertificateInfo info, string password)
     {
-        var path = Path.Combine(VaultDir, info.FileName);
+        var path = Path.Combine(_vaultDirectory, info.FileName);
         try
         {
             return new X509Certificate2(path, password,
@@ -184,7 +193,7 @@ public class CertificateVault
     /// <summary>Удаляет сохранённый сертификат с компьютера (PFX-файл и запись).</summary>
     public void Delete(SavedCertificateInfo info, AppSettings settings)
     {
-        var path = Path.Combine(VaultDir, info.FileName);
+        var path = Path.Combine(_vaultDirectory, info.FileName);
         if (File.Exists(path))
         {
             // затираем содержимое перед удалением — в файле лежал закрытый ключ

@@ -10,6 +10,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SignService\SignService.csproj" />
+    <!-- Смоук интерфейса без экрана. -->
+    <PackageReference Include="Avalonia.Headless" Version="11.3.18" />
   </ItemGroup>
 
   <ItemGroup>

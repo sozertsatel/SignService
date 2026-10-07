@@ -30,6 +30,12 @@ public partial class SignFileItem : ObservableObject
 
     public string FilePath { get; }
 
+    /// <summary>
+    /// Модель окна, в очереди которой стоит файл: из контекстного меню файла
+    /// (всплывающее окно вне дерева элементов) команды доступны только через неё.
+    /// </summary>
+    public MainWindowViewModel? Owner { get; init; }
+
     public string FileName { get; }
 
     public string SizeDisplay { get; }
@@ -80,7 +86,19 @@ public partial class SignFileItem : ObservableObject
         }
 
         ExtraCount = _extraSignatures.Count;
+        // Новая подпись другого лица должна попасть в .sig — файл снова ждёт подписания.
+        if (added > 0 && Status == SignStatus.Signed)
+            ResetForSigning();
         return added;
+    }
+
+    /// <summary>Возвращает файл в очередь (после смены сертификата или новых подписей).</summary>
+    public void ResetForSigning()
+    {
+        Status = SignStatus.Pending;
+        Message = null;
+        SignaturePath = null;
+        SignerCount = 0;
     }
 
     public string StatusDisplay => Status switch

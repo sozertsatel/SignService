@@ -195,7 +195,7 @@ Console.WriteLine($"stale signature excluded by name ({coSign.ExcludedSigners[0]
 
 try
 {
-    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object[] { new[] { sigStale }, payload });
+    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object?[] { new[] { sigStale }, payload, null });
     throw new Exception("expected failure when all signatures mismatch");
 }
 catch (TargetInvocationException e)
@@ -204,11 +204,19 @@ catch (TargetInvocationException e)
     Console.WriteLine("all-mismatch merge fails with clear error: OK");
 }
 
-var hashDoc = mergerType.GetMethod("HashDocument", BindingFlags.NonPublic | BindingFlags.Static)!;
-var gostHash = (byte[]?)hashDoc.Invoke(null, new object?[] { "1.2.643.7.1.1.2.2", payload });
+// Проверка подписей хеширует документ через BouncyCastle — результат должен
+// совпадать с собственным Стрибогом (им считаются signing-certificate-v2 и запрос TSA).
+var docDigests = new DocumentDigests(payload);
+var gostHash = docDigests.Get("1.2.643.7.1.1.2.2");
+var gostHash512 = docDigests.Get("1.2.643.7.1.1.2.3");
 var expected256 = (byte[])h256.Invoke(null, new object[] { payload })!;
-if (gostHash is null || !gostHash.SequenceEqual(expected256)) throw new Exception("GOST doc hash path broken");
-Console.WriteLine("GOST digest OID → Streebog-256 doc hash: OK");
+var expected512 = (byte[])h512.Invoke(null, new object[] { payload })!;
+if (gostHash is null || !gostHash.SequenceEqual(expected256)) throw new Exception("GOST-256 doc hash path broken");
+if (gostHash512 is null || !gostHash512.SequenceEqual(expected512)) throw new Exception("GOST-512 doc hash path broken");
+docDigests.Get("1.2.643.7.1.1.2.2");
+if (docDigests.Get("1.2.3.4.999") is not null) throw new Exception("unknown digest must be null");
+if (docDigests.Computations != 2) throw new Exception("document must be hashed once per algorithm");
+Console.WriteLine("GOST digest OIDs → Streebog-256/512 doc hash, one pass per algorithm: OK");
 
 // ===== 9. Извлечение из криптоконтейнера =====
 var extractDir = Path.Combine(tempRoot, "extract");
@@ -475,8 +483,13 @@ catch (ArgumentException)
 }
 
 // ===== 13. Хранилище сертификатов на компьютере (PFX с паролем) =====
-var vault = new CertificateVault();
-var vaultSettings = new AppSettings(); // пишет в реальный %AppData% — тестовые записи чистим ниже
+if (!args.Contains("--skip-user-store"))
+{
+// PFX и настройки — во временной папке; системное хранилище (Личное) затрагивается
+// только установкой/удалением ниже, поэтому раздел можно пропустить флагом.
+var vaultDir = Path.Combine(tempRoot, "certificates");
+var vault = new CertificateVault(vaultDir);
+var vaultSettings = new AppSettings(Path.Combine(tempRoot, "settings"));
 
 var savedInfo = vault.Save(cert, "test-пароль-123", vaultSettings);
 if (savedInfo.Thumbprint != cert.Thumbprint || savedInfo.Subject != "Тестовый Пользователь")
@@ -562,15 +575,15 @@ catch (InvalidOperationException e) when (e.Message.Contains("не был уст
 }
 
 // удаление: файл затёрт и удалён, запись убрана
-var pfxPath = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-    "SignService", "certificates", savedInfo.FileName);
+var pfxPath = Path.Combine(vaultDir, savedInfo.FileName);
 if (!File.Exists(pfxPath)) throw new Exception("pfx file missing before delete");
 vault.Delete(savedInfo, vaultSettings);
 if (File.Exists(pfxPath)) throw new Exception("pfx file must be deleted");
 if (vault.List(vaultSettings).Any(c => c.Thumbprint == savedInfo.Thumbprint))
     throw new Exception("saved record must be removed");
 Console.WriteLine("cert vault: delete wipes file and record: OK");
+}
+else Console.WriteLine("cert vault: skipped (--skip-user-store; no user data or certificate store changes)");
 
 // ===== 14. Сборка криптоконтейнера без подписания =====
 var bDir = Path.Combine(tempRoot, "build_container");
@@ -660,7 +673,7 @@ await File.WriteAllTextAsync(poaXmlPath, $"""
     <?xml version="1.0" encoding="UTF-8"?>
     <Доверенность xmlns="urn://x-artefacts/EMCHD_1" ВерсФорм="EMCHD_1">
       <Документ><Довер>
-        <СвДов СрокДейст="{poaValidTo}" ДатаВыдДовер="2026-07-09" НомДовер="b24f0fb1-3ee0-4b50-bb84-da89832ac7c2"/>
+        <СвДов СрокДейст="{poaValidTo}" ДатаВыдДовер="{DateTime.Today.AddDays(-1):yyyy-MM-dd}" НомДовер="b24f0fb1-3ee0-4b50-bb84-da89832ac7c2"/>
         <СвДоверит ТипДоверит="1"><Доверит><РосОргДовер>
           <СвРосОрг ОГРН="1262300003151" ИННЮЛ="2301119162" НаимОрг="ООО ВЕКТОР"/>
           <ЛицоБезДов><СвФЛ Должность="Директор" СНИЛС="999-999-999 99" ИННФЛ="999999999999">
@@ -697,7 +710,7 @@ using var repCert = MakeRepCert("771378577706", "14350728243");
 using var strangerCert = MakeRepCert("111111111111", "11111111111");
 
 var okCheck = PowerOfAttorneyService.Validate(poaInfo, repCert);
-if (okCheck.State != PowerOfAttorneyService.CheckState.Ok) throw new Exception("poa validate must pass: " + okCheck.Message);
+if (okCheck.State != PowerOfAttorneyService.CheckState.Warning) throw new Exception("untrusted head cert must produce warning: " + okCheck.Message);
 var strangerCheck = PowerOfAttorneyService.Validate(poaInfo, strangerCert);
 if (strangerCheck.State != PowerOfAttorneyService.CheckState.Error) throw new Exception("stranger cert must fail");
 Console.WriteLine("POA validate: representative match / mismatch by INN+SNILS: OK");
@@ -739,6 +752,58 @@ poaCms.Decode(await File.ReadAllBytesAsync(poaSignResult.SignaturePath));
 poaCms.CheckSignature(verifySignatureOnly: true);
 Console.WriteLine("sign with POA: signature valid, EMCHD xml+sig copied next to document: OK");
 
+// ===== 17. Штамп: выбор страниц и раскладка =====
+var rp = PdfStamper.ResolvePages(new PdfStamper.StampOptions { Pages = PdfStamper.StampPages.Custom, CustomPages = "1,3-5,9" }, 10);
+if (!rp.SequenceEqual(new[] { 0, 2, 3, 4, 8 })) throw new Exception("custom pages parse wrong: " + string.Join(",", rp));
+if (!PdfStamper.ResolvePages(new PdfStamper.StampOptions { Pages = PdfStamper.StampPages.All }, 3).SequenceEqual(new[] { 0, 1, 2 }))
+    throw new Exception("all pages wrong");
+if (!PdfStamper.ResolvePages(new PdfStamper.StampOptions(), 7).SequenceEqual(new[] { 6 }))
+    throw new Exception("last page default wrong");
+try
+{
+    PdfStamper.ResolvePages(new PdfStamper.StampOptions { Pages = PdfStamper.StampPages.Custom, CustomPages = "abc" }, 3);
+    throw new Exception("bad pages must fail");
+}
+catch (InvalidOperationException) { }
+Console.WriteLine("stamp pages: parse (1,3-5,9), all, last, bad input: OK");
+
+// штамп на всех страницах с несколькими подписантами — по плашке на каждого
+var multiStamped = PdfStamper.CreateStampedCopy(
+    pdfPath,
+    new[] { cert, certB, certC },
+    new PdfStamper.StampOptions { Pages = PdfStamper.StampPages.All, WithDate = true },
+    DateTime.Now);
+if (!File.Exists(multiStamped)) throw new Exception("multi-signer all-pages stamp failed");
+Console.WriteLine("stamp: 3 signers × all pages rendered: OK");
+
+// ===== 18. Окно «Подписанты и проверка ЭЦП»: результат проверки по подписантам =====
+var vReport = SignatureVerifier.Verify(Merge(sigA, sigB), payload, VerificationOptions.CryptographyOnly);
+if (vReport.Signers.Count != 2) throw new Exception("verify: expected 2 signers");
+if (!vReport.CryptographicallyValid) throw new Exception("verify: both must pass");
+if (!vReport.Signers.All(s => s.SigningTime is not null)) throw new Exception("verify: signing time missing");
+Console.WriteLine("verify: 2 valid signers, crypto+doc checks pass: OK");
+
+// подпись под другой версией → подписант помечается, второй остаётся корректным
+var vBad = SignatureVerifier.Verify(Merge(sigA, sigStale), payload, VerificationOptions.CryptographyOnly);
+if (vBad.Signers.Count(s => s.CryptographicallyValid) != 1) throw new Exception("verify: stale signer must fail");
+if (!vBad.Signers.Any(s => s.Document.State == VerificationState.Invalid)) throw new Exception("verify: mismatch not reported");
+Console.WriteLine("verify: stale signer flagged, valid one passes: OK");
+
+// прикреплённая подпись проверяется без внешнего документа
+var vAttached = SignatureVerifier.Verify(attachedA, null, VerificationOptions.CryptographyOnly);
+if (!vAttached.Attached || vAttached.Signers.Count != 1 || !vAttached.CryptographicallyValid)
+    throw new Exception("verify attached failed");
+Console.WriteLine("verify: attached container without external doc: OK");
+
+// текстовый отчёт содержит ключевые поля
+var vText = vReport.ToReport("документ.bin.sig", "документ.bin");
+if (!vText.Contains("Подписантов: 2") || !vText.Contains("Документ") || !vText.Contains("Цепочка доверия"))
+    throw new Exception("verify report format wrong");
+Console.WriteLine("verify: text report format: OK");
+
+await VerificationTests.RunAsync(tempRoot);
+await ReviewRegressionTests.RunAsync(tempRoot, signer);
+UiSmokeTests.Run(tempRoot);
 try { Directory.Delete(tempRoot, true); } catch { }
 Console.WriteLine("ALL TESTS PASSED");
 return 0;

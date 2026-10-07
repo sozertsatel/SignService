@@ -40,14 +40,17 @@ internal static class CmsMerger
         IReadOnlyList<string> UnverifiedSigners);
 
     /// <summary>
-    /// Объединяет подписи с проверкой соответствия каждой из них документу:
-    /// у подписанта из подписанных атрибутов берётся messageDigest и сравнивается
-    /// с хешем документа (ГОСТ Р 34.11-2012 — своей реализацией Стрибога, SHA-1/256/384/512 —
-    /// штатно). Подписи, сделанные под другим файлом или прежней версией документа,
-    /// ИСКЛЮЧАЮТСЯ из результата (их список — в ExcludedSigners). Подписи, чей алгоритм
-    /// хеша проверить нечем, сохраняются и перечисляются в UnverifiedSigners.
+    /// Проверяет хеш документа, значение подписи и привязку сертификата каждого
+    /// подписанта. Подписи, которые однозначно не соответствуют документу (другая
+    /// версия, повреждённое значение, чужой сертификат), исключаются. Подписи, которые
+    /// проверить не удалось (неизвестный алгоритм, нет сертификата, ошибка библиотеки),
+    /// сохраняются с указанием в UnverifiedSigners. Доверие УЦ проверяется отдельно.
     /// </summary>
-    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document)
+    /// <param name="attach">
+    /// true — результат прикреплённый (с этим документом), false — откреплённый,
+    /// null — прикреплённый, если прикреплённым был хотя бы один вход.
+    /// </param>
+    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document, bool? attach = null)
     {
         if (signatures.Count == 0)
             throw new ArgumentException("Нет подписей для объединения.", nameof(signatures));
@@ -56,21 +59,40 @@ internal static class CmsMerger
 
         // Справочник сертификатов всех входов — для имени подписанта в отчёте.
         var certIndex = BuildCertIndex(parsed);
-        var hashCache = new Dictionary<string, byte[]?>();
         var excluded = new List<string>();
         var unverified = new List<string>();
 
+        var contentTypes = parsed.Select(p => new AsnReader(p.EncapContentInfo, AsnEncodingRules.BER)
+            .ReadSequence().ReadObjectIdentifier()).Distinct().ToList();
+        if (contentTypes.Count != 1)
+            throw new InvalidOperationException("Нельзя объединить подписи с разными типами содержимого CMS.");
+        var allCertificates = DedupeBytes(parsed.SelectMany(p => p.Certificates));
+        var attachOutput = attach ?? parsed.Any(p => p.HasContent);
+
+        // Вложенный документ входов не используется: каждый подписант проверяется
+        // по текущему документу, который хешируется один раз на алгоритм.
+        var detachedEncap = StripContent(parsed[0].EncapContentInfo);
+        var digests = new DocumentDigests(document);
         foreach (var p in parsed)
         {
+            p.EncapContentInfo = detachedEncap;
+            p.HasContent = false;
             for (var i = p.Signers.Count - 1; i >= 0; i--)
             {
-                var (_, der) = p.Signers[i];
-                var check = CheckSignerAgainstDocument(der, document, hashCache);
-                if (check == SignerDocMatch.Match)
+                var single = new ParsedSignedData { Version = p.Version, EncapContentInfo = detachedEncap };
+                single.Signers.Add(p.Signers[i]);
+                single.DigestAlgorithms.AddRange(p.DigestAlgorithms);
+                single.Certificates.AddRange(allCertificates);
+                var result = SignatureVerifier.VerifyWithDigests(BuildMerged(new List<ParsedSignedData> { single }),
+                    digests, VerificationOptions.CryptographyOnly);
+                var check = result.Signers.SingleOrDefault();
+                if (check?.CryptographicallyValid == true)
                     continue;
 
-                var name = SignerDisplayName(der, certIndex);
-                if (check == SignerDocMatch.Mismatch)
+                var name = SignerDisplayName(p.Signers[i].Der, certIndex);
+                if (check is not null && (check.Document.State == VerificationState.Invalid
+                        || check.Signature.State == VerificationState.Invalid
+                        || check.CertificateBinding.State == VerificationState.Invalid))
                 {
                     excluded.Add(name);
                     p.Signers.RemoveAt(i);
@@ -84,7 +106,13 @@ internal static class CmsMerger
 
         if (parsed.All(p => p.Signers.Count == 0))
             throw new InvalidOperationException(
-                "Все объединяемые подписи не соответствуют текущему содержимому документа.");
+                "Все объединяемые подписи повреждены или не соответствуют текущему содержимому документа.");
+
+        if (attachOutput)
+        {
+            parsed[0].EncapContentInfo = EncapWithContent(contentTypes[0], document);
+            parsed[0].HasContent = true;
+        }
 
         var merged = BuildMerged(parsed);
         return new MergeResult(
@@ -109,7 +137,21 @@ internal static class CmsMerger
 
     private static byte[] BuildMerged(List<ParsedSignedData> parsed)
     {
-
+        var types = parsed.Select(p => new AsnReader(p.EncapContentInfo, AsnEncodingRules.BER)
+            .ReadSequence().ReadObjectIdentifier()).Distinct().Count();
+        if (types != 1) throw new InvalidOperationException("Типы содержимого CMS различаются.");
+        var attached = parsed.Where(p => p.HasContent).ToList();
+        if (attached.Select(p => Convert.ToBase64String(p.EncapContentInfo)).Distinct().Count() > 1)
+        {
+            var contents = attached.Select(p =>
+            {
+                var encap = new AsnReader(p.EncapContentInfo, AsnEncodingRules.BER).ReadSequence();
+                encap.ReadObjectIdentifier();
+                return ReadOctetStringData(encap.ReadSequence(new Asn1Tag(TagClass.ContextSpecific, 0)));
+            }).ToList();
+            if (contents.Skip(1).Any(c => !c.AsSpan().SequenceEqual(contents[0])))
+                throw new InvalidOperationException("Прикреплённые подписи содержат разные документы.");
+        }
         var version = parsed.Max(p => p.Version);
         var digestAlgorithms = DedupeBytes(parsed.SelectMany(p => p.DigestAlgorithms));
         var certificates = DedupeBytes(parsed.SelectMany(p => p.Certificates));
@@ -188,6 +230,50 @@ internal static class CmsMerger
         var certIndex = BuildCertIndex(new List<ParsedSignedData> { parsed });
         var names = parsed.Signers.Select(s => SignerDisplayName(s.Der, certIndex)).ToList();
         return new ContainerInfo(parsed.HasContent, names);
+    }
+
+    /// <summary>
+    /// Подписант контейнера: Id — DER SignerIdentifier в hex (устойчив при
+    /// одинаковых ФИО), CertificateId — серийный номер сертификата (или SKI).
+    /// </summary>
+    public sealed record SignerDescriptor(string Id, string Name, string CertificateId);
+
+    public static IReadOnlyList<SignerDescriptor> GetSigners(byte[] signature)
+    {
+        var parsed = Parse(Normalize(signature));
+        var index = BuildCertIndex(new List<ParsedSignedData> { parsed });
+        return parsed.Signers.Select(s =>
+        {
+            var reader = new AsnReader(Convert.FromHexString(s.SidKey), AsnEncodingRules.BER);
+            string identifier;
+            if (reader.PeekTag().TagClass == TagClass.Universal)
+            {
+                var sid = reader.ReadSequence();
+                sid.ReadEncodedValue();                                    // issuer
+                identifier = Convert.ToHexString(sid.ReadIntegerBytes().Span);
+            }
+            else
+            {
+                identifier = s.SidKey;                                     // [0] subjectKeyIdentifier
+            }
+
+            return new SignerDescriptor(s.SidKey, SignerDisplayName(s.Der, index), identifier);
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Удаляет SignerInfo по идентификатору (см. <see cref="GetSigners"/>), сохраняя
+    /// документ, сертификаты и остальных подписантов. Последнего подписанта удалить нельзя.
+    /// </summary>
+    public static byte[] RemoveSigner(byte[] signature, string signerId)
+    {
+        var parsed = Parse(Normalize(signature));
+        if (!parsed.Signers.Any(s => s.SidKey == signerId))
+            throw new InvalidOperationException("Выбранного подписанта нет в этом файле подписи.");
+        parsed.Signers.RemoveAll(s => s.SidKey == signerId);
+        if (parsed.Signers.Count == 0)
+            throw new InvalidOperationException("Нельзя исключить последнего подписанта: подпись станет пустой.");
+        return BuildMerged(new List<ParsedSignedData> { parsed });
     }
 
     /// <summary>
@@ -388,20 +474,25 @@ internal static class CmsMerger
         var parsed = Parse(Normalize(signature));
 
         // Тип содержимого сохраняем из исходной подписи (обычно id-data).
-        var encap = new AsnReader(parsed.EncapContentInfo, AsnEncodingRules.BER).ReadSequence();
-        var contentType = encap.ReadObjectIdentifier();
+        var contentType = new AsnReader(parsed.EncapContentInfo, AsnEncodingRules.BER)
+            .ReadSequence().ReadObjectIdentifier();
+        parsed.EncapContentInfo = EncapWithContent(contentType, document);
+        parsed.HasContent = true;
+        return BuildMerged(new List<ParsedSignedData> { parsed });
+    }
 
+    // EncapsulatedContentInfo с вложенным документом: SEQUENCE { eContentType, [0] EXPLICIT OCTET STRING }.
+    private static byte[] EncapWithContent(string contentType, byte[] document)
+    {
         var writer = new AsnWriter(AsnEncodingRules.DER);
-        using (writer.PushSequence())                      // EncapsulatedContentInfo
+        using (writer.PushSequence())
         {
             writer.WriteObjectIdentifier(contentType);
-            using (writer.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0))) // [0] EXPLICIT
+            using (writer.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
                 writer.WriteOctetString(document);
         }
 
-        parsed.EncapContentInfo = writer.Encode();
-        parsed.HasContent = true;
-        return BuildMerged(new List<ParsedSignedData> { parsed });
+        return writer.Encode();
     }
 
     // EncapContentInfo без eContent: SEQUENCE { eContentType } — для откреплённой подписи.
@@ -491,114 +582,6 @@ internal static class CmsMerger
                 "Не удалось разобрать подпись: файл не является корректной CMS/PKCS#7 подписью. " + e.Message, e);
         }
     }
-
-    /// <summary>Итог сверки подписи с документом.</summary>
-    public enum DocMatch
-    {
-        Match,
-        Mismatch,
-        Unknown,
-    }
-
-    /// <summary>
-    /// Сверяет подпись с документом по messageDigest всех подписантов
-    /// (для ГОСТ — Стрибогом, без криптопровайдера). Mismatch — хотя бы один
-    /// подписант подписал другой файл; Match — все совпали; Unknown — проверить нечем.
-    /// </summary>
-    public static DocMatch CheckAgainstDocument(byte[] signature, byte[] document)
-    {
-        var parsed = Parse(Normalize(signature));
-        var cache = new Dictionary<string, byte[]?>();
-        var anyMatch = false;
-        foreach (var (_, der) in parsed.Signers)
-        {
-            switch (CheckSignerAgainstDocument(der, document, cache))
-            {
-                case SignerDocMatch.Mismatch:
-                    return DocMatch.Mismatch;
-                case SignerDocMatch.Match:
-                    anyMatch = true;
-                    break;
-            }
-        }
-
-        return anyMatch ? DocMatch.Match : DocMatch.Unknown;
-    }
-
-    private enum SignerDocMatch
-    {
-        Match,
-        Mismatch,
-        Unknown,
-    }
-
-    // Сверяет подпись с документом по messageDigest из подписанных атрибутов.
-    // Без атрибутов (голый PKCS#7) или с неподдерживаемым алгоритмом хеша — Unknown.
-    private static SignerDocMatch CheckSignerAgainstDocument(
-        byte[] signerInfoDer, byte[] document, Dictionary<string, byte[]?> hashCache)
-    {
-        try
-        {
-            var (digestOid, messageDigest) = InspectSigner(signerInfoDer);
-            if (messageDigest is null)
-                return SignerDocMatch.Unknown;
-
-            if (!hashCache.TryGetValue(digestOid, out var docHash))
-            {
-                docHash = HashDocument(digestOid, document);
-                hashCache[digestOid] = docHash;
-            }
-
-            if (docHash is null)
-                return SignerDocMatch.Unknown;
-
-            return docHash.AsSpan().SequenceEqual(messageDigest)
-                ? SignerDocMatch.Match
-                : SignerDocMatch.Mismatch;
-        }
-        catch (AsnContentException)
-        {
-            return SignerDocMatch.Unknown;
-        }
-    }
-
-    // (OID алгоритма хеша, значение messageDigest из подписанных атрибутов или null).
-    private static (string DigestOid, byte[]? MessageDigest) InspectSigner(byte[] signerInfoDer)
-    {
-        var signerInfo = new AsnReader(signerInfoDer, AsnEncodingRules.BER).ReadSequence();
-        signerInfo.ReadInteger();                                    // version
-        signerInfo.ReadEncodedValue();                               // sid
-        var digestAlgorithm = signerInfo.ReadSequence();             // AlgorithmIdentifier
-        var digestOid = digestAlgorithm.ReadObjectIdentifier();
-
-        var signedAttrsTag = new Asn1Tag(TagClass.ContextSpecific, 0, isConstructed: true);
-        if (!signerInfo.HasData || signerInfo.PeekTag() != signedAttrsTag)
-            return (digestOid, null);
-
-        var attrs = signerInfo.ReadSetOf(signedAttrsTag);
-        while (attrs.HasData)
-        {
-            var attr = attrs.ReadSequence();
-            if (attr.ReadObjectIdentifier() == "1.2.840.113549.1.9.4") // messageDigest
-            {
-                var values = attr.ReadSetOf();
-                return (digestOid, values.ReadOctetString());
-            }
-        }
-
-        return (digestOid, null);
-    }
-
-    private static byte[]? HashDocument(string digestOid, byte[] document) => digestOid switch
-    {
-        "1.2.643.7.1.1.2.2" => Streebog.Hash256(document),   // ГОСТ Р 34.11-2012 (256)
-        "1.2.643.7.1.1.2.3" => Streebog.Hash512(document),   // ГОСТ Р 34.11-2012 (512)
-        "2.16.840.1.101.3.4.2.1" => SHA256.HashData(document),
-        "2.16.840.1.101.3.4.2.2" => SHA384.HashData(document),
-        "2.16.840.1.101.3.4.2.3" => SHA512.HashData(document),
-        "1.3.14.3.2.26" => SHA1.HashData(document),
-        _ => null,                                            // ГОСТ 34.11-94 и прочее — не проверяем
-    };
 
     // «Кому выдан» (CN) сертификата подписанта по его SignerIdentifier, либо номер-заглушка.
     private static string SignerDisplayName(

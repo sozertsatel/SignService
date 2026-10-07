@@ -5,6 +5,8 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography.X509Certificates;
 using System.Xml.Linq;
+using System.Xml;
+using System.Collections.Generic;
 
 namespace SignService.Services;
 
@@ -19,8 +21,10 @@ namespace SignService.Services;
 public static class PowerOfAttorneyService
 {
     private const string SnilsOid = "1.2.643.100.3";
-    private const string InnFlOid = "1.2.643.3.131.1.1";
-    private const string InnLegacyOid = "1.2.643.100.4";
+    // ИНН: у физлица — 12 цифр; «00» + 10 цифр — прежняя запись ИНН организации.
+    private const string InnOid = "1.2.643.3.131.1.1";
+    // ИНН юридического лица (ИНН ЮЛ), 10 цифр — личным ИНН не является.
+    private const string InnLeOid = "1.2.643.100.4";
 
     /// <summary>Сведения о доверенности из XML.</summary>
     public sealed record PoaInfo(
@@ -33,7 +37,13 @@ public static class PowerOfAttorneyService
         string PrincipalInn,
         string RepresentativeName,
         string RepresentativeInn,
-        string RepresentativeSnils);
+        string RepresentativeSnils)
+    {
+        public IReadOnlyList<Representative> Representatives { get; init; } = Array.Empty<Representative>();
+    }
+
+    public sealed record Representative(string Name, string Inn, string Snils);
+    internal sealed record PoaPackage(PoaInfo Info, byte[] Xml, byte[] Signature, CheckResult Check);
 
     public enum CheckState
     {
@@ -48,7 +58,15 @@ public static class PowerOfAttorneyService
     /// <summary>Разбирает XML МЧД (EMCHD_1). Пространство имён допускается любое.</summary>
     public static PoaInfo Parse(string xmlPath, string sigPath)
     {
-        var doc = XDocument.Load(xmlPath);
+        return ParseBytes(File.ReadAllBytes(xmlPath), xmlPath, sigPath);
+    }
+
+    private static PoaInfo ParseBytes(byte[] xml, string xmlPath, string sigPath)
+    {
+        using var input = new MemoryStream(xml, writable: false);
+        using var reader = XmlReader.Create(input, new XmlReaderSettings
+            { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null, MaxCharactersInDocument = 8 * 1024 * 1024 });
+        var doc = XDocument.Load(reader);
         var root = doc.Root ?? throw new InvalidOperationException("Пустой XML-файл доверенности.");
         if (root.Name.LocalName != "Доверенность")
             throw new InvalidOperationException(
@@ -71,13 +89,12 @@ public static class PowerOfAttorneyService
         var org = Find(root, "СвРосОрг");
         // Представитель — в блоке СвУпПред; у руководителя (ЛицоБезДов) похожие поля,
         // поэтому ищем строго внутри СвУпПред.
-        var pred = Find(root, "СвУпПред") is { } up ? Find(up, "СведФизЛ") : null;
-        var fio = pred is not null ? Find(pred, "ФИО") : null;
-
-        var repName = string.Join(" ", new[]
-        {
-            Attr(fio, "Фамилия"), Attr(fio, "Имя"), Attr(fio, "Отчество"),
-        }.Where(s => s.Length > 0));
+        var representatives = root.Descendants().Where(e => e.Name.LocalName == "СвУпПред")
+            .SelectMany(e => e.Descendants().Where(p => p.Name.LocalName == "СведФизЛ"))
+            .Select(p => new Representative(string.Join(" ", new[] { Attr(Find(p, "ФИО"), "Фамилия"),
+                Attr(Find(p, "ФИО"), "Имя"), Attr(Find(p, "ФИО"), "Отчество") }.Where(s => s.Length > 0)),
+                Attr(p, "ИННФЛ"), Attr(p, "СНИЛС"))).Distinct().ToArray();
+        var representative = representatives.FirstOrDefault() ?? new Representative("", "", "");
 
         return new PoaInfo(
             xmlPath,
@@ -87,68 +104,119 @@ public static class PowerOfAttorneyService
             Date(Attr(svDov, "СрокДейст")),
             Attr(org, "НаимОрг"),
             Attr(org, "ИННЮЛ"),
-            repName,
-            Attr(pred, "ИННФЛ"),
-            Attr(pred, "СНИЛС"));
+            representative.Name, representative.Inn, representative.Snils) { Representatives = representatives };
     }
 
     /// <summary>
-    /// Проверяет доверенность: подпись руководителя соответствует XML (по messageDigest,
-    /// для ГОСТ — Стрибогом), срок действия не истёк, представитель в МЧД совпадает
+    /// Проверяет доверенность: подпись руководителя криптографически соответствует XML,
+    /// срок действия не истёк, представитель в МЧД совпадает
     /// с выбранным сертификатом (по ИНН/СНИЛС из subject).
     /// </summary>
-    public static CheckResult Validate(PoaInfo poa, X509Certificate2? signerCertificate)
+    public static CheckResult Validate(PoaInfo poa, X509Certificate2? signerCertificate, VerificationOptions? options = null)
     {
-        // 1. Подпись руководителя соответствует файлу МЧД
         try
         {
-            var xml = File.ReadAllBytes(poa.XmlPath);
-            var sig = File.ReadAllBytes(poa.SigPath);
-            switch (CmsMerger.CheckAgainstDocument(sig, xml))
-            {
-                case CmsMerger.DocMatch.Mismatch:
-                    return new CheckResult(CheckState.Error,
-                        "Подпись руководителя НЕ соответствует файлу МЧД (подписан другой файл или другая версия).");
-                case CmsMerger.DocMatch.Unknown:
-                    return new CheckResult(CheckState.Warning,
-                        "Не удалось проверить соответствие подписи руководителя файлу МЧД.");
-            }
+            return Prepare(poa, signerCertificate, options).Check;
         }
         catch (Exception e)
         {
             return new CheckResult(CheckState.Error, "Не удалось разобрать подпись руководителя: " + e.Message);
         }
 
-        // 2. Срок действия
-        if (poa.ValidTo is { } validTo && validTo.Date < DateTime.Today)
-            return new CheckResult(CheckState.Error,
-                $"Срок действия МЧД истёк {validTo:dd.MM.yyyy}.");
+    }
 
-        // 3. Представитель соответствует сертификату подписанта
-        if (signerCertificate is not null)
+    internal static PoaPackage Prepare(PoaInfo selected, X509Certificate2? signerCertificate,
+        VerificationOptions? options = null)
+    {
+        // Parse, verify and later copy exactly these bytes, never cached fields or a second read.
+        var xml = File.ReadAllBytes(selected.XmlPath);
+        var sig = File.ReadAllBytes(selected.SigPath);
+        var poa = ParseBytes(xml, selected.XmlPath, selected.SigPath);
+        options ??= new VerificationOptions();
+        var result = Check();
+        return new PoaPackage(poa, xml, sig, result);
+
+        CheckResult Check()
         {
-            var certInn = Digits(SubjectValue(signerCertificate, InnFlOid))
-                is { Length: > 0 } innFl ? innFl : Digits(SubjectValue(signerCertificate, InnLegacyOid));
-            var certSnils = Digits(SubjectValue(signerCertificate, SnilsOid));
-            var poaInn = Digits(poa.RepresentativeInn);
-            var poaSnils = Digits(poa.RepresentativeSnils);
-
-            var innOk = certInn.Length > 0 && poaInn.Length > 0 && certInn == poaInn;
-            var snilsOk = certSnils.Length > 0 && poaSnils.Length > 0 && certSnils == poaSnils;
-
-            if (!innOk && !snilsOk)
-            {
-                if (certInn.Length == 0 && certSnils.Length == 0)
-                    return new CheckResult(CheckState.Warning,
-                        "В сертификате нет ИНН/СНИЛС — соответствие представителя МЧД не проверено.");
+            var verification = SignatureVerifier.Verify(sig, xml, options);
+            if (!verification.CryptographicallyValid)
+                return new CheckResult(CheckState.Error, "Подпись руководителя не прошла полную криптографическую проверку МЧД. "
+                    + verification.Container.Message + " " + string.Join("; ", verification.Signers.Select(s => s.Signature.Message + " " + s.Document.Message)));
+            if (string.IsNullOrWhiteSpace(poa.Number) || poa.IssueDate is null || poa.ValidTo is null
+                || poa.ValidTo < poa.IssueDate)
+                return new CheckResult(CheckState.Error, "В МЧД отсутствуют или некорректны номер и даты действия.");
+            if (poa.IssueDate.Value.Date > DateTime.Today)
+                return new CheckResult(CheckState.Error, "МЧД ещё не вступила в силу.");
+            if (poa.ValidTo is { } validTo && validTo.Date < DateTime.Today)
                 return new CheckResult(CheckState.Error,
-                    $"Представитель в МЧД ({poa.RepresentativeName}) не совпадает с владельцем сертификата по ИНН/СНИЛС.");
-            }
-        }
+                    $"Срок действия МЧД истёк {validTo:dd.MM.yyyy}.");
 
-        return new CheckResult(CheckState.Ok, "Доверенность проверена: подпись руководителя "
-            + "соответствует МЧД, срок действия не истёк"
-            + (signerCertificate is null ? "." : ", представитель совпадает с сертификатом."));
+            var warnings = new List<string>();
+            // Представитель соответствует сертификату подписанта.
+            if (signerCertificate is not null)
+            {
+                var certInn = PersonalInn(signerCertificate);
+                var certSnils = Digits(SubjectValue(signerCertificate, SnilsOid));
+                var match = poa.Representatives.FirstOrDefault(r =>
+                {
+                    var inn = Digits(r.Inn); var snils = Digits(r.Snils);
+                    return (certInn.Length == 0 || inn.Length == 0 || certInn == inn)
+                        && (certSnils.Length == 0 || snils.Length == 0 || certSnils == snils)
+                        && (certInn.Length > 0 && certInn == inn || certSnils.Length > 0 && certSnils == snils);
+                });
+                if (match is null)
+                {
+                    if (certInn.Length == 0 && certSnils.Length == 0)
+                        warnings.Add("В сертификате нет ИНН/СНИЛС — соответствие представителя МЧД не проверено.");
+                    else
+                        return new CheckResult(CheckState.Error,
+                            $"Представитель в МЧД ({poa.RepresentativeName}) не совпадает с владельцем сертификата по ИНН/СНИЛС.");
+                }
+                else
+                    poa = poa with { RepresentativeName = match.Name, RepresentativeInn = match.Inn, RepresentativeSnils = match.Snils };
+            }
+            foreach (var signer in verification.Signers)
+            {
+                var trust = signer.CertificateTrust;
+                var revocation = signer.Revocation;
+                // Срок сертификата руководителя мог истечь уже после выдачи МЧД — сама МЧД
+                // при этом продолжает действовать. Без доверенной метки TSA время подписи
+                // не доказано: проверяем сертификат на дату выдачи и предупреждаем.
+                if (trust.State == VerificationState.Invalid && signer.NotAfter < options.ValidationTime.UtcDateTime
+                    && !HasTrustedTimestamp(signer, options))
+                {
+                    var issued = poa.IssueDate!.Value;
+                    var moment = MomentOnIssueDay(issued, signer.NotBefore, signer.NotAfter);
+                    if (moment is null)
+                        return new CheckResult(CheckState.Error,
+                            $"Сертификат руководителя не действовал на дату выдачи МЧД {issued:dd.MM.yyyy} "
+                            + $"(срок сертификата {signer.NotBefore:dd.MM.yyyy} — {signer.NotAfter:dd.MM.yyyy}).");
+                    var historical = SignatureVerifier.Verify(sig, xml, options with { ValidationTime = moment.Value })
+                        .Signers.First(s => s.Number == signer.Number);
+                    trust = historical.CertificateTrust;
+                    revocation = historical.Revocation;
+                    warnings.Add($"Сертификат руководителя истёк {signer.NotAfter:dd.MM.yyyy} — после выдачи МЧД "
+                        + $"{issued:dd.MM.yyyy}; на дату выдачи он действовал. Время подписи МЧД не подтверждено "
+                        + "меткой TSA — убедитесь, что МЧД зарегистрирована и не отозвана в реестре ФНС.");
+                }
+
+                if (trust.State == VerificationState.Invalid || revocation.State == VerificationState.Invalid)
+                    return new CheckResult(CheckState.Error, trust.Message + " " + revocation.Message);
+                if (trust.State != VerificationState.Valid || revocation.State != VerificationState.Valid)
+                    warnings.Add("Доверие или отзыв сертификата руководителя не подтверждены.");
+                var principalInn = Digits(poa.PrincipalInn);
+                var cert = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(signer.Certificate!);
+                var innValues = OrganizationInns(cert);
+                if (innValues.Count > 0 && principalInn.Length > 0 && innValues.Any(v => v != principalInn))
+                    return new CheckResult(CheckState.Error, "ИНН организации в сертификате руководителя не совпадает с доверителем МЧД.");
+                if (innValues.Count == 0 || principalInn.Length == 0)
+                    warnings.Add("Связь сертификата руководителя с организацией-доверителем не подтверждена по ИНН.");
+            }
+            if (signerCertificate is null) warnings.Add("Сертификат представителя не выбран.");
+            const string passed = "Подпись МЧД криптографически корректна, срок действия проверен. ";
+            return new CheckResult(warnings.Count > 0 ? CheckState.Warning : CheckState.Ok,
+                passed + string.Join(" ", warnings.Distinct()) + " Полномочия и отзыв самой МЧД в реестре проверяются отдельно.");
+        }
     }
 
     /// <summary>
@@ -157,13 +225,82 @@ public static class PowerOfAttorneyService
     /// </summary>
     public static void CopyNextToDocument(PoaInfo poa, string documentPath)
     {
-        var directory = Path.GetDirectoryName(Path.GetFullPath(documentPath)) ?? ".";
-        foreach (var source in new[] { poa.XmlPath, poa.SigPath })
+        var package = Prepare(poa, null);
+        if (package.Check.State == CheckState.Error) throw new InvalidOperationException(package.Check.Message);
+        CopyPackage(package, documentPath);
+    }
+
+    internal static void CheckCopyTargets(PoaPackage package, string documentPath)
+    {
+        foreach (var (target, bytes) in CopyTargets(package, documentPath))
+            if (File.Exists(target) && !File.ReadAllBytes(target).AsSpan().SequenceEqual(bytes))
+                throw new IOException($"Рядом с документом уже есть другой файл МЧД «{Path.GetFileName(target)}». Выберите другой каталог.");
+    }
+
+    internal static void CopyPackage(PoaPackage package, string documentPath)
+    {
+        CheckCopyTargets(package, documentPath);
+        var created = new List<string>();
+        try
         {
-            var target = Path.Combine(directory, Path.GetFileName(source));
-            if (!File.Exists(target))
-                File.Copy(source, target);
+            foreach (var (target, bytes) in CopyTargets(package, documentPath))
+                if (!File.Exists(target)) { AtomicFile.Write(target, bytes); created.Add(target); }
+            CheckCopyTargets(package, documentPath);
         }
+        catch { foreach (var path in created) File.Delete(path); throw; }
+    }
+
+    private static IEnumerable<(string Path, byte[] Bytes)> CopyTargets(PoaPackage package, string documentPath)
+    {
+        var directory = Path.GetDirectoryName(Path.GetFullPath(documentPath))!;
+        var xmlTarget = Path.Combine(directory, Path.GetFileName(package.Info.XmlPath));
+        var sigTarget = Path.Combine(directory, Path.GetFileName(package.Info.SigPath));
+        if (string.Equals(xmlTarget, sigTarget, StringComparison.OrdinalIgnoreCase)
+            || new[] { xmlTarget, sigTarget }.Any(p => string.Equals(p, Path.GetFullPath(documentPath), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(p, Path.GetFullPath(documentPath + ".sig"), StringComparison.OrdinalIgnoreCase)))
+            throw new IOException("Имена файлов МЧД совпадают с документом или его подписью.");
+        yield return (xmlTarget, package.Xml);
+        yield return (sigTarget, package.Signature);
+    }
+
+    // Метка TSA, которой можно верить, сама задаёт момент проверки сертификата.
+    private static bool HasTrustedTimestamp(SignerVerification signer, VerificationOptions options) =>
+        options.CheckCertificateTrust && signer.Timestamp.State == VerificationState.Valid && signer.TimestampTime is not null;
+
+    /// <summary>
+    /// Момент дня выдачи МЧД, когда сертификат действовал; null — не действовал.
+    /// Дата МЧД — без времени и пояса, поэтому день берётся с запасом на часовые
+    /// пояса РФ (UTC+2…UTC+12): с 12:00 UTC предыдущего дня до 22:00 UTC этого.
+    /// </summary>
+    internal static DateTimeOffset? MomentOnIssueDay(DateTime issueDate, DateTime notBefore, DateTime notAfter)
+    {
+        var dayStart = new DateTimeOffset(DateTime.SpecifyKind(issueDate.Date, DateTimeKind.Utc)).AddHours(-12);
+        var dayEnd = dayStart.AddHours(34);
+        var validFrom = new DateTimeOffset(DateTime.SpecifyKind(notBefore, DateTimeKind.Utc));
+        var validTo = new DateTimeOffset(DateTime.SpecifyKind(notAfter, DateTimeKind.Utc));
+        var from = validFrom > dayStart ? validFrom : dayStart;
+        var to = validTo < dayEnd ? validTo : dayEnd;
+        return from <= to ? from + (to - from) / 2 : null;
+    }
+
+    /// <summary>
+    /// Личный ИНН владельца сертификата (ИНН ФЛ): только 12 цифр из 1.2.643.3.131.1.1.
+    /// ИНН организации (1.2.643.100.4 или «00» + ИНН ЮЛ) личным не считается.
+    /// </summary>
+    private static string PersonalInn(X509Certificate2 certificate)
+    {
+        var inn = Digits(SubjectValue(certificate, InnOid));
+        return inn.Length == 12 && !inn.StartsWith("00", StringComparison.Ordinal) ? inn : "";
+    }
+
+    /// <summary>ИНН организации в сертификате: 1.2.643.100.4 и прежняя запись «00» + ИНН ЮЛ.</summary>
+    private static List<string> OrganizationInns(Org.BouncyCastle.X509.X509Certificate certificate)
+    {
+        var subject = certificate.SubjectDN;
+        return subject.GetValueList(new Org.BouncyCastle.Asn1.DerObjectIdentifier(InnLeOid)).Select(Digits)
+            .Concat(subject.GetValueList(new Org.BouncyCastle.Asn1.DerObjectIdentifier(InnOid)).Select(Digits)
+                .Where(v => v.Length == 12 && v.StartsWith("00", StringComparison.Ordinal)).Select(v => v[2..]))
+            .Where(v => v.Length > 0).Distinct().ToList();
     }
 
     /// <summary>Значение RDN субъекта сертификата по OID (СНИЛС/ИНН и т.п.).</summary>
