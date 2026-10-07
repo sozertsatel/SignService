@@ -154,6 +154,7 @@ public partial class MainWindowViewModel : ObservableObject
     [NotifyCanExecuteChangedFor(nameof(ExtractCommand))]
     [NotifyCanExecuteChangedFor(nameof(MergeFilesCommand))]
     [NotifyCanExecuteChangedFor(nameof(BuildContainerCommand))]
+    [NotifyCanExecuteChangedFor(nameof(VerifySignatureCommand))]
     private bool _isBusy;
 
     [ObservableProperty]
@@ -182,9 +183,6 @@ public partial class MainWindowViewModel : ObservableObject
     /// </summary>
     public Func<bool, Task<Views.StampOptionsDialog.Result?>>? RequestStampOptionsAsync { get; set; }
 
-    /// <summary>Показ отчёта «Подписанты и проверка ЭЦП» (реализуется окном).</summary>
-    public Action<string>? ShowSignersReport { get; set; }
-
     /// <summary>
     /// Запрос диалога выбора файлов; обрабатывается в MainWindow,
     /// т.к. StorageProvider доступен только на уровне окна.
@@ -206,11 +204,12 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>Запрос диалога выбора документа для сборки криптоконтейнера.</summary>
     public event EventHandler? BuildContainerRequested;
 
-    /// <summary>Запрос диалога выбора .sig для проверки ЭЦП.</summary>
-    public event EventHandler? VerifyFileRequested;
-
-    [RelayCommand(CanExecute = nameof(CanBrowse))]
-    private void VerifyFile() => VerifyFileRequested?.Invoke(this, EventArgs.Empty);
+    /// <summary>
+    /// Открыть окно «Проверка ЭЦП» (реализуется окном). Пути подписи и документа
+    /// необязательны: если подпись указана, проверка запускается сразу.
+    /// Возвращает краткий итог последней проверки для лога (null — проверки не было).
+    /// </summary>
+    public Func<string?, string?, Task<string?>>? ShowVerificationAsync { get; set; }
 
     /// <summary>
     /// Запрос пароля у пользователя (заголовок, сообщение, предупреждение или null,
@@ -321,7 +320,7 @@ public partial class MainWindowViewModel : ObservableObject
         try
         {
             var info = PowerOfAttorneyService.Parse(xmlPath, sigPath);
-            var check = PowerOfAttorneyService.Validate(info, SelectedCertificate?.Certificate);
+            var check = PowerOfAttorneyService.Validate(info, SelectedCertificate?.Certificate, _settings.CreateVerificationOptions());
 
             if (check.State == PowerOfAttorneyService.CheckState.Error)
             {
@@ -678,6 +677,18 @@ public partial class MainWindowViewModel : ObservableObject
     [RelayCommand(CanExecute = nameof(CanBrowse))]
     private void BuildContainer() => BuildContainerRequested?.Invoke(this, EventArgs.Empty);
 
+    [RelayCommand(CanExecute = nameof(CanBrowse))]
+    private Task VerifySignature() => OpenVerificationAsync(null, null);
+
+    private async Task OpenVerificationAsync(string? signaturePath, string? documentPath)
+    {
+        if (ShowVerificationAsync is null)
+            return;
+        var summary = await ShowVerificationAsync(signaturePath, documentPath);
+        if (summary is not null)
+            StatusText = summary;
+    }
+
     /// <summary>
     /// Собирает прикреплённый криптоконтейнер (документ + имеющиеся подписи)
     /// без создания своей подписи.
@@ -802,42 +813,7 @@ public partial class MainWindowViewModel : ObservableObject
             return;
         }
 
-        await VerifySignatureFileAsync(sigPath);
-    }
-
-    /// <summary>Просмотр подписантов и проверка ЭЦП для файла подписи.</summary>
-    public async Task VerifySignatureFileAsync(string sigPath)
-    {
-        IsBusy = true;
-        try
-        {
-            var documentPath = sigPath.EndsWith(".sig", StringComparison.OrdinalIgnoreCase)
-                ? sigPath[..^4]
-                : null;
-            byte[]? document = documentPath is not null && System.IO.File.Exists(documentPath)
-                ? await System.IO.File.ReadAllBytesAsync(documentPath)
-                : null;
-            var signature = await System.IO.File.ReadAllBytesAsync(sigPath);
-
-            var report = await Task.Run(() => SignatureVerifier.Verify(signature, document));
-            var text = SignatureVerifier.Format(
-                report,
-                document is null
-                    ? (report.Attached ? "(внутри контейнера)" : "(не найден)")
-                    : System.IO.Path.GetFileName(documentPath!),
-                System.IO.Path.GetFileName(sigPath));
-
-            StatusText = $"Проверка ЭЦП «{System.IO.Path.GetFileName(sigPath)}»: {report.Summary}";
-            ShowSignersReport?.Invoke(text);
-        }
-        catch (Exception ex)
-        {
-            StatusText = "Проверка ЭЦП: " + ex.Message;
-        }
-        finally
-        {
-            IsBusy = false;
-        }
+        await OpenVerificationAsync(sigPath, item.FilePath);
     }
 
     /// <summary>ПКМ: штамп для файла из списка (диалог параметров → копия без подписи).</summary>
@@ -1015,19 +991,6 @@ public partial class MainWindowViewModel : ObservableObject
             stampParameters = stampResult.Options;
         }
 
-        // Перед подписанием с МЧД перепроверяем её против фактического сертификата.
-        if (Poa is { } poaCheck)
-        {
-            var check = PowerOfAttorneyService.Validate(poaCheck, certificate);
-            if (check.State == PowerOfAttorneyService.CheckState.Error)
-            {
-                StatusText = "Подписание остановлено — проблема с МЧД: " + check.Message;
-                return;
-            }
-            if (check.State == PowerOfAttorneyService.CheckState.Warning)
-                Log("⚠ МЧД: " + check.Message);
-        }
-
         IsBusy = true;
 
         var signed = 0;
@@ -1035,6 +998,18 @@ public partial class MainWindowViewModel : ObservableObject
 
         try
         {
+            var poaVerificationOptions = Poa is null ? null : _settings.CreateVerificationOptions();
+            // Перед подписанием с МЧД перепроверяем её против фактического сертификата.
+            if (Poa is { } poaCheck)
+            {
+                var check = await Task.Run(() => PowerOfAttorneyService.Validate(poaCheck, certificate, poaVerificationOptions));
+                if (check.State == PowerOfAttorneyService.CheckState.Error)
+                {
+                    StatusText = "Подписание остановлено — проблема с МЧД: " + check.Message;
+                    return;
+                }
+                if (check.State == PowerOfAttorneyService.CheckState.Warning) Log("⚠ МЧД: " + check.Message);
+            }
             foreach (var file in Files.Where(f => f.Status != SignStatus.Signed).ToList())
             {
                 file.Status = SignStatus.Signing;
@@ -1057,6 +1032,7 @@ public partial class MainWindowViewModel : ObservableObject
                         StampLogoPath = StampLogoPath,
                         StampParameters = stampParameters,
                         PowerOfAttorney = Poa,
+                        PoaVerificationOptions = poaVerificationOptions,
                     };
                     var result = await Task.Run(
                         () => _documentSigner.SignFileAsync(file.FilePath, certificate, options));
@@ -1088,6 +1064,11 @@ public partial class MainWindowViewModel : ObservableObject
                     Log($"  [ОШИБКА] {file.FileName}: {ex.Message}");
                 }
             }
+        }
+        catch (Exception ex)
+        {
+            StatusText = "Подписание остановлено: " + ex.Message;
+            return;
         }
         finally
         {

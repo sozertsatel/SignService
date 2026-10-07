@@ -66,6 +66,8 @@ public class DocumentSigner
         /// подписанного документа (как это делает Контур), номер попадает в PDF-штамп.
         /// </summary>
         public PowerOfAttorneyService.PoaInfo? PowerOfAttorney { get; init; }
+
+        public VerificationOptions? PoaVerificationOptions { get; init; }
     }
 
     /// <summary>
@@ -118,6 +120,12 @@ public class DocumentSigner
         SignOptions options,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        var poaPackage = options.PowerOfAttorney is { } selectedPoa
+            ? PowerOfAttorneyService.Prepare(selectedPoa, certificate, options.PoaVerificationOptions) : null;
+        if (poaPackage?.Check.State == PowerOfAttorneyService.CheckState.Error)
+            throw new InvalidOperationException(poaPackage.Check.Message);
+        if (poaPackage is not null) PowerOfAttorneyService.CheckCopyTargets(poaPackage, filePath);
         // Режим «подписывать копию со штампом»: штамп меняет содержимое PDF,
         // поэтому копия создаётся ДО подписания и подписывается именно она.
         // В режиме «копия отдельно» подписывается ОРИГИНАЛ, а штампованная копия
@@ -126,9 +134,10 @@ public class DocumentSigner
         var stampAsCopy = options.Stamp && !options.StampSignCopy && PdfStamper.IsPdf(filePath);
         var stampOptions = options.StampParameters
             ?? new PdfStamper.StampOptions { WithDate = options.StampWithDate, LogoPath = options.StampLogoPath };
+        // Номер МЧД — из проверенного снимка файлов, а не из сохранённых ранее сведений.
         stampOptions = stampOptions with
         {
-            PoaNumber = stampOptions.PoaNumber ?? options.PowerOfAttorney?.Number,
+            PoaNumber = stampOptions.PoaNumber ?? poaPackage?.Info.Number,
         };
         if (options.Stamp && options.StampSignCopy && PdfStamper.IsPdf(filePath))
         {
@@ -174,9 +183,10 @@ public class DocumentSigner
         int signerCount;
         IReadOnlyList<string> excluded;
         IReadOnlyList<string> unverified;
+        byte[] output;
         if (inputs.Count == 1)
         {
-            await File.WriteAllBytesAsync(signaturePath, own, cancellationToken);
+            output = own;
             signerCount = 1;
             excluded = Array.Empty<string>();
             unverified = Array.Empty<string>();
@@ -186,14 +196,18 @@ public class DocumentSigner
             // Объединение с проверкой: подписи под другим файлом или прежней версией
             // документа исключаются — иначе портал отклонит весь контейнер.
             var merged = CmsMerger.MergeForDocument(inputs, data);
-            await File.WriteAllBytesAsync(signaturePath, merged.Signature, cancellationToken);
+            output = options.Detached ? CmsMerger.ConvertToDetached(merged.Signature)
+                : CmsMerger.AttachContent(merged.Signature, data);
             signerCount = merged.SignerCount;
             excluded = merged.ExcludedSigners;
             unverified = merged.UnverifiedSigners;
         }
 
-        if (options.PowerOfAttorney is { } poa)
-            PowerOfAttorneyService.CopyNextToDocument(poa, targetPath);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!(await File.ReadAllBytesAsync(targetPath, cancellationToken)).AsSpan().SequenceEqual(data))
+            throw new IOException("Документ изменился во время подписания. Подпись не сохранена; повторите операцию.");
+        if (poaPackage is not null) PowerOfAttorneyService.CopyPackage(poaPackage, targetPath);
+        await AtomicFile.WriteAsync(signaturePath, output, overwrite: true, cancellationToken);
 
         // Режим «копия отдельно»: штампованная копия БЕЗ подписи, со всеми
         // подписантами итогового .sig — пересоздаётся после каждого подписания.
@@ -365,21 +379,11 @@ public class DocumentSigner
 
     /// <summary>
     /// Проверяет откреплённую подпись для файла (только криптографическую
-    /// корректность, без проверки доверия цепочки). ГОСТ-подписи вне Windows
-    /// проверить нельзя — SignedCms их не разбирает.
+    /// корректность, без проверки доверия цепочки). ГОСТ поддерживается
+    /// управляемой библиотекой на любой платформе без криптопровайдера.
     /// </summary>
     public bool VerifyDetached(byte[] data, byte[] signature)
     {
-        var signedCms = new SignedCms(new ContentInfo(data), detached: true);
-        signedCms.Decode(signature);
-        try
-        {
-            signedCms.CheckSignature(verifySignatureOnly: true);
-            return true;
-        }
-        catch (System.Security.Cryptography.CryptographicException)
-        {
-            return false;
-        }
+        return SignatureVerifier.Verify(signature, data, VerificationOptions.CryptographyOnly).CryptographicallyValid;
     }
 }

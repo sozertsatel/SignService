@@ -44,11 +44,15 @@ public partial class MainWindow : Window
                 vm.StampOnlyRequested += async (_, _) => await BrowseStampOnlyAsync(vm);
                 vm.BuildContainerRequested += async (_, _) => await BrowseBuildContainerAsync(vm);
                 vm.AddPoaRequested += async (_, _) => await BrowsePoaAsync(vm);
-                vm.VerifyFileRequested += async (_, _) => await BrowseVerifyAsync(vm);
                 vm.RequestStampOptionsAsync = async showSignCopy =>
                     await new StampOptionsDialog(vm.BuildInitialStampOptions(), vm.StampSignCopy, showSignCopy)
                         .ShowDialog<StampOptionsDialog.Result?>(this);
-                vm.ShowSignersReport = text => _ = new SignersDialog(text).ShowDialog(this);
+                vm.ShowVerificationAsync = async (signaturePath, documentPath) =>
+                {
+                    var dialog = new VerificationDialog(vm.Settings, signaturePath, documentPath);
+                    await dialog.ShowDialog(this);
+                    return dialog.LastSummary;
+                };
                 vm.PropertyChanged += (_, args) =>
                 {
                     // автопрокрутка лога вниз
@@ -224,26 +228,6 @@ public partial class MainWindow : Window
 
         vm.SaveStampOptions(options);
         await vm.StampWithoutSigningAsync(paths, options.Options);
-    }
-
-    private async System.Threading.Tasks.Task BrowseVerifyAsync(MainWindowViewModel vm)
-    {
-        var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-        {
-            Title = "Файл подписи для проверки (документ ищется рядом по имени)",
-            AllowMultiple = false,
-            FileTypeFilter = new[]
-            {
-                new FilePickerFileType("Подписи CMS (*.sig, *.p7s, *.p7m)")
-                {
-                    Patterns = new[] { "*.sig", "*.p7s", "*.p7m" },
-                },
-                FilePickerFileTypes.All,
-            },
-        });
-
-        if (files.FirstOrDefault()?.TryGetLocalPath() is { } path)
-            await vm.VerifySignatureFileAsync(path);
     }
 
     private async System.Threading.Tasks.Task BrowsePoaAsync(MainWindowViewModel vm)
