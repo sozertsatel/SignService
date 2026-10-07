@@ -28,7 +28,19 @@ public static class SignatureVerifier
         Task.Run(() => Verify(signature, document, options, cancellationToken), cancellationToken);
 
     public static SignatureVerificationResult Verify(byte[] signature, byte[]? document = null,
-        VerificationOptions? options = null, CancellationToken cancellationToken = default)
+        VerificationOptions? options = null, CancellationToken cancellationToken = default) =>
+        VerifyCore(signature, document, null, options, cancellationToken);
+
+    /// <summary>
+    /// Проверка с общим кешем хешей документа: при проверке нескольких подписей
+    /// одного документа (объединение) он хешируется один раз на алгоритм.
+    /// </summary>
+    internal static SignatureVerificationResult VerifyWithDigests(byte[] signature, DocumentDigests document,
+        VerificationOptions? options = null, CancellationToken cancellationToken = default) =>
+        VerifyCore(signature, document.Document, document, options, cancellationToken);
+
+    private static SignatureVerificationResult VerifyCore(byte[] signature, byte[]? document, DocumentDigests? digests,
+        VerificationOptions? options, CancellationToken cancellationToken)
     {
         options ??= new VerificationOptions();
         try
@@ -39,16 +51,18 @@ public static class SignatureVerifier
             var attached = original.SignedContent is not null;
             var embedded = attached ? CmsMerger.ExtractContent(normalized) : null;
             var content = document ?? embedded;
-            var cms = content is null ? original : new CmsSignedData(
-                new CmsProcessableByteArray(original.SignedContentType, content), normalized);
-            var certificates = cms.GetCertificates().EnumerateMatches(null).ToList();
-            var crls = cms.GetCrls().EnumerateMatches(null).ToList();
+            if (content is not null && (digests is null || !ReferenceEquals(digests.Document, content)))
+                digests = new DocumentDigests(content);
+            var signers = original.GetSignerInfos().GetSigners().ToList();
+            var verifiable = digests is null ? signers : VerifiableSigners(original, normalized, signers, digests);
+            var certificates = original.GetCertificates().EnumerateMatches(null).ToList();
+            var crls = original.GetCrls().EnumerateMatches(null).ToList();
             var results = new List<SignerVerification>();
-            foreach (var signer in cms.GetSignerInfos().GetSigners())
+            foreach (var signer in verifiable)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var matches = cms.GetCertificates().EnumerateMatches(signer.SignerID).ToList();
-                results.Add(VerifySigner(signer, matches, certificates, crls, content,
+                var matches = original.GetCertificates().EnumerateMatches(signer.SignerID).ToList();
+                results.Add(VerifySigner(signer, matches, certificates, crls, digests,
                     embedded is not null && document is not null && !embedded.AsSpan().SequenceEqual(document),
                     results.Count + 1, options, cancellationToken));
             }
@@ -66,8 +80,37 @@ public static class SignatureVerifier
         }
     }
 
+    // Подписанты с подписанными атрибутами проверяются по заранее вычисленному хешу
+    // документа (BouncyCastle не хеширует документ заново для каждого подписанта).
+    // Без signedAttrs (голый PKCS#7) подпись считается над самим содержимым —
+    // такие подписанты проверяются по документу.
+    private static List<SignerInformation> VerifiableSigners(CmsSignedData original, byte[] normalized,
+        List<SignerInformation> signers, DocumentDigests digests)
+    {
+        var hashes = new Dictionary<string, byte[]>();
+        foreach (var signer in signers)
+            hashes[signer.DigestAlgorithmID.Algorithm.Id] = digests.Get(signer.DigestAlgorithmID.Algorithm.Id) ?? Array.Empty<byte>();
+        var byDigest = new CmsSignedData(hashes, normalized).GetSignerInfos().GetSigners().ToList();
+        List<SignerInformation>? byContent = null;
+        var result = new List<SignerInformation>(signers.Count);
+        for (var i = 0; i < signers.Count; i++)
+        {
+            if (signers[i].SignedAttributes is not null && hashes[signers[i].DigestAlgorithmID.Algorithm.Id].Length > 0)
+            {
+                result.Add(byDigest[i]);
+                continue;
+            }
+
+            byContent ??= new CmsSignedData(new CmsProcessableByteArray(original.SignedContentType, digests.Document),
+                normalized).GetSignerInfos().GetSigners().ToList();
+            result.Add(byContent[i]);
+        }
+
+        return result;
+    }
+
     private static SignerVerification VerifySigner(SignerInformation signer, List<X509Certificate> matches,
-        List<X509Certificate> certificates, List<X509Crl> crls, byte[]? document, bool attachedMismatch,
+        List<X509Certificate> certificates, List<X509Crl> crls, DocumentDigests? document, bool attachedMismatch,
         int number, VerificationOptions options, CancellationToken cancellationToken)
     {
         var cert = matches.Count == 1 ? matches[0] : null;
@@ -90,7 +133,14 @@ public static class SignatureVerifier
                     : VerificationCheck.Invalid("Значение подписи неверно: подпись повреждена или подделана.");
             }
             catch (Exception e) when (UnsupportedAlgorithm(e)) { signatureCheck = VerificationCheck.Unknown("Алгоритм не поддерживается: " + e.Message); }
-            catch (Exception e) { signatureCheck = VerificationCheck.Invalid("Подпись не прошла проверку: " + e.Message); }
+            // Хеш документа не совпал — подпись относится к другому содержимому.
+            catch (Exception) when (documentCheck.State == VerificationState.Invalid)
+            {
+                signatureCheck = VerificationCheck.Invalid("Подпись не соответствует документу: " + documentCheck.Message);
+            }
+            // Иное исключение библиотеки (необычные параметры ключа, кодировка) — не доказательство
+            // подделки: «не определено», чтобы законный соподписант не был исключён из объединения.
+            catch (Exception e) { signatureCheck = VerificationCheck.Unknown("Подпись не удалось проверить: " + e.Message); }
         }
         else if (document is null)
             signatureCheck = VerificationCheck.NotChecked("Нет исходного документа для полной проверки подписи.");
@@ -110,7 +160,7 @@ public static class SignatureVerifier
             certificate.Revocation, timestamp.Check, timestamp.Time, cert?.GetEncoded());
     }
 
-    private static VerificationCheck CheckDocument(SignerInformation signer, byte[] document)
+    private static VerificationCheck CheckDocument(SignerInformation signer, DocumentDigests document)
     {
         try
         {
@@ -120,12 +170,14 @@ public static class SignatureVerifier
             if (attr.AttrValues.Count != 1)
                 return VerificationCheck.Invalid("Некорректный атрибут messageDigest.");
             var digest = Asn1OctetString.GetInstance(attr.AttrValues[0]).GetOctets();
-            return DigestUtilities.CalculateDigest(signer.DigestAlgorithmID.Algorithm.Id, document).AsSpan().SequenceEqual(digest)
+            var actual = document.Get(signer.DigestAlgorithmID.Algorithm.Id);
+            if (actual is null)
+                return VerificationCheck.Unknown("Алгоритм хеша не поддерживается: " + signer.DigestAlgorithmID.Algorithm.Id);
+            return actual.AsSpan().SequenceEqual(digest)
                 ? VerificationCheck.Valid("Хеш соответствует текущему содержимому документа.")
                 : VerificationCheck.Invalid("Хеш не совпал: подпись относится к другому файлу или его прежней версии.");
         }
-        catch (SecurityUtilityException e) { return VerificationCheck.Unknown("Алгоритм хеша не поддерживается: " + e.Message); }
-        catch (Exception e) { return VerificationCheck.Invalid("Не удалось проверить messageDigest: " + e.Message); }
+        catch (Exception e) { return VerificationCheck.Unknown("Не удалось проверить messageDigest: " + e.Message); }
     }
 
     internal static VerificationCheck CheckCertificateBinding(SignerInformation signer, X509Certificate certificate)
@@ -160,7 +212,7 @@ public static class SignatureVerifier
             return VerificationCheck.Valid("Хеш и идентификатор сертификата в подписанных атрибутах совпали.");
         }
         catch (SecurityUtilityException e) { return VerificationCheck.Unknown("Алгоритм привязки сертификата не поддерживается: " + e.Message); }
-        catch (Exception e) { return VerificationCheck.Invalid("Некорректная привязка сертификата: " + e.Message); }
+        catch (Exception e) { return VerificationCheck.Unknown("Не удалось проверить привязку сертификата: " + e.Message); }
     }
 
     private static bool IssuerMatches(IssuerSerial? issuer, X509Certificate certificate) => issuer is null
@@ -245,5 +297,45 @@ public static class SignatureVerifier
         for (Exception? current = exception; current is not null; current = current.InnerException)
             if (current is SecurityUtilityException or NotSupportedException) return true;
         return false;
+    }
+}
+
+/// <summary>
+/// Хеши одного документа по OID алгоритма: каждый алгоритм вычисляется один раз,
+/// сколько бы подписантов его ни использовали.
+/// </summary>
+internal sealed class DocumentDigests
+{
+    private readonly Dictionary<string, byte[]?> _digests = new();
+
+    public DocumentDigests(byte[] document) => Document = document;
+
+    public byte[] Document { get; }
+
+    /// <summary>Сколько раз документ хешировался (для тестов).</summary>
+    public int Computations { get; private set; }
+
+    /// <summary>Хеш документа; null — алгоритм не поддерживается.</summary>
+    public byte[]? Get(string digestOid)
+    {
+        lock (_digests)
+        {
+            if (!_digests.TryGetValue(digestOid, out var digest))
+            {
+                try
+                {
+                    digest = DigestUtilities.CalculateDigest(digestOid, Document);
+                    Computations++;
+                }
+                catch (SecurityUtilityException)
+                {
+                    digest = null;
+                }
+
+                _digests[digestOid] = digest;
+            }
+
+            return digest;
+        }
     }
 }

@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
-using System.Linq;
 
 namespace SignService.Services;
 
@@ -91,11 +90,30 @@ public class AppSettings
     /// <summary>Разрешение запросов CRL/OCSP при проверке ЭЦП.</summary>
     public bool VerificationAllowNetwork { get; set; }
 
-    public VerificationOptions CreateVerificationOptions(bool allowNetwork = false) => new()
+    /// <summary>
+    /// Параметры проверки ЭЦП из настроек: дополнительные доверенные корни и разрешение
+    /// сетевых запросов CRL/OCSP. Недоступный или повреждённый файл корня пропускается,
+    /// а описание добавляется в <paramref name="problems"/> — проверка не прерывается.
+    /// </summary>
+    public VerificationOptions CreateVerificationOptions(ICollection<string>? problems = null)
     {
-        TrustedRoots = VerificationTrustedRootPaths.Select(File.ReadAllBytes).ToArray(),
-        AllowNetwork = allowNetwork,
-    };
+        var roots = new List<byte[]>();
+        foreach (var path in VerificationTrustedRootPaths)
+        {
+            try
+            {
+                var certificate = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(File.ReadAllBytes(path))
+                    ?? throw new InvalidDataException("в файле нет сертификата");
+                roots.Add(certificate.GetEncoded());
+            }
+            catch (Exception e)
+            {
+                problems?.Add($"Доверенный корень «{path}» пропущен: {e.Message}");
+            }
+        }
+
+        return new VerificationOptions { TrustedRoots = roots, AllowNetwork = VerificationAllowNetwork };
+    }
 
     public static AppSettings Load()
     {

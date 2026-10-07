@@ -34,11 +34,11 @@ internal static class CertificateValidator
             var roots = options.TrustedRoots.Select(parser.ReadCertificate).ToList();
             var candidates = embedded.Concat(options.ExtraCertificates.Select(parser.ReadCertificate)).ToList();
             if (options.UseSystemTrustStore)
-                foreach (var location in new[] { StoreLocation.CurrentUser, StoreLocation.LocalMachine })
-                {
-                    ReadStore(StoreName.Root, location, roots);
-                    ReadStore(StoreName.CertificateAuthority, location, candidates);
-                }
+            {
+                var system = SystemStores();
+                roots.AddRange(system.Roots);
+                candidates.AddRange(system.Intermediates);
+            }
             // A root supplied inside a CMS is an intermediate candidate, never a trust anchor.
             roots = roots.Distinct().ToList();
             if (roots.Count == 0)
@@ -76,6 +76,36 @@ internal static class CertificateValidator
             return new CertificateValidation(options.CheckCertificateTrust
                 ? VerificationCheck.Unknown("Не удалось построить допустимую цепочку до доверенного корня: " + e.Message) : notChecked,
                 options.CheckRevocation ? VerificationCheck.Unknown("Отзыв не подтверждён без допустимой цепочки.") : notChecked);
+        }
+    }
+
+    // Хранилища ОС читаются не на каждую подпись: пакетная проверка и объединение
+    // обращаются к ним многократно. Короткое время жизни подхватывает новые корни.
+    private static readonly TimeSpan SystemStoreLifetime = TimeSpan.FromMinutes(2);
+    private static readonly object SystemStoreLock = new();
+    private static (DateTime LoadedAt, IReadOnlyList<Certificate> Roots, IReadOnlyList<Certificate> Intermediates)? _systemStores;
+
+    /// <summary>Сколько раз читались хранилища ОС (для тестов кеша).</summary>
+    internal static int SystemStoreLoads { get; private set; }
+
+    private static (IReadOnlyList<Certificate> Roots, IReadOnlyList<Certificate> Intermediates) SystemStores()
+    {
+        lock (SystemStoreLock)
+        {
+            if (_systemStores is { } cached && DateTime.UtcNow - cached.LoadedAt < SystemStoreLifetime)
+                return (cached.Roots, cached.Intermediates);
+
+            var roots = new List<Certificate>();
+            var intermediates = new List<Certificate>();
+            foreach (var location in new[] { StoreLocation.CurrentUser, StoreLocation.LocalMachine })
+            {
+                ReadStore(StoreName.Root, location, roots);
+                ReadStore(StoreName.CertificateAuthority, location, intermediates);
+            }
+
+            SystemStoreLoads++;
+            _systemStores = (DateTime.UtcNow, roots, intermediates);
+            return (roots, intermediates);
         }
     }
 

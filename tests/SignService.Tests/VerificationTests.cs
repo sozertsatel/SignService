@@ -244,8 +244,9 @@ internal static class VerificationTests
         await WritePoa(Xml(DateTime.Today.AddDays(10)));
         var selected = PowerOfAttorneyService.Parse(xmlPath, sigPath);
         Assert(PowerOfAttorneyService.Validate(selected, representative).State == PowerOfAttorneyService.CheckState.Warning, "untrusted POA head warns");
+        // Сертификат руководителя истёк ещё до выдачи МЧД (истечение после выдачи — предупреждение).
         using var expiredHead = new CertificateRequest("CN=Expired head", headRsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
-            .CreateSelfSigned(DateTimeOffset.Now.AddDays(-5), DateTimeOffset.Now.AddDays(-1));
+            .CreateSelfSigned(DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddDays(-5));
         await File.WriteAllBytesAsync(sigPath, signer.Sign(await File.ReadAllBytesAsync(xmlPath), expiredHead));
         Assert(PowerOfAttorneyService.Validate(selected, head).State == PowerOfAttorneyService.CheckState.Error,
             "missing representative identifiers cannot skip invalid head certificate");

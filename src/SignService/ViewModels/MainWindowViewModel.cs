@@ -49,10 +49,9 @@ public partial class MainWindowViewModel : ObservableObject
         Files.CollectionChanged += (_, _) => SignAllCommand.NotifyCanExecuteChanged();
         RefreshCertificates();
 
-        // Восстанавливаем ранее добавленную МЧД (с повторной проверкой).
-        if (_settings.PoaXmlPath is { } poaXml && _settings.PoaSigPath is { } poaSig
-            && System.IO.File.Exists(poaXml) && System.IO.File.Exists(poaSig))
-            SetPoa(poaXml, poaSig, quiet: true);
+        // Восстанавливаем ранее добавленную МЧД: повторная проверка идёт в фоне.
+        if (_settings.PoaXmlPath is { } poaXml && _settings.PoaSigPath is { } poaSig)
+            _ = SetPoaAsync(poaXml, poaSig, restoring: true);
 
         _ = CheckUpdatesOnStartAsync();
     }
@@ -363,19 +362,27 @@ public partial class MainWindowViewModel : ObservableObject
     /// <summary>
     /// Загружает и проверяет доверенность МЧД (как Контур: XML + подпись
     /// руководителя, проверка подписи, срока и соответствия представителя
-    /// выбранному сертификату).
+    /// выбранному сертификату). Проверка цепочки и отзыва идёт в фоне, на это
+    /// время команды недоступны. При восстановлении после запуска итог — в лог.
     /// </summary>
-    public void SetPoa(string xmlPath, string sigPath, bool quiet = false)
+    public async Task SetPoaAsync(string xmlPath, string sigPath, bool restoring = false)
     {
+        var prefix = restoring ? "Сохранённая МЧД: " : "";
+        IsBusy = true;
         try
         {
-            var info = PowerOfAttorneyService.Parse(xmlPath, sigPath);
-            var check = PowerOfAttorneyService.Validate(info, SelectedCertificate?.Certificate, _settings.CreateVerificationOptions());
+            var options = CreateVerificationOptions();
+            var certificate = SelectedCertificate?.Certificate;
+            var (info, check) = await Task.Run(() =>
+            {
+                var parsed = PowerOfAttorneyService.Parse(xmlPath, sigPath);
+                return (parsed, PowerOfAttorneyService.Validate(parsed, certificate, options));
+            });
 
             if (check.State == PowerOfAttorneyService.CheckState.Error)
             {
                 Poa = null;
-                StatusText = "Доверенность НЕ добавлена: " + check.Message;
+                Report("Доверенность НЕ добавлена: " + check.Message);
                 return;
             }
 
@@ -388,19 +395,35 @@ public partial class MainWindowViewModel : ObservableObject
                 + (info.ValidTo is { } v ? $" (до {v:dd.MM.yyyy})" : "")
                 + $", доверитель: {info.PrincipalOrg}, представитель: {info.RepresentativeName}. "
                 + check.Message;
-            if (check.State == PowerOfAttorneyService.CheckState.Warning)
-                summary = "⚠ " + summary;
-            if (!quiet)
-                StatusText = summary;
-            else
-                Log(summary);
+            Report(check.State == PowerOfAttorneyService.CheckState.Warning ? "⚠ " + summary : summary);
         }
         catch (Exception ex)
         {
             Poa = null;
-            if (!quiet)
-                StatusText = "Не удалось загрузить МЧД: " + ex.Message;
+            Report("Не удалось загрузить МЧД: " + ex.Message);
         }
+        finally
+        {
+            IsBusy = false;
+        }
+
+        void Report(string message)
+        {
+            if (restoring)
+                Log(prefix + message);
+            else
+                StatusText = message;
+        }
+    }
+
+    // Параметры проверки ЭЦП из настроек; пропущенные файлы доверенных корней — в лог.
+    private VerificationOptions CreateVerificationOptions()
+    {
+        var problems = new List<string>();
+        var options = _settings.CreateVerificationOptions(problems);
+        foreach (var problem in problems)
+            Log("⚠ " + problem);
+        return options;
     }
 
     [RelayCommand]
@@ -1161,17 +1184,29 @@ public partial class MainWindowViewModel : ObservableObject
 
         try
         {
-            var poaVerificationOptions = Poa is null ? null : _settings.CreateVerificationOptions();
-            // Перед подписанием с МЧД перепроверяем её против фактического сертификата.
-            if (Poa is { } poaCheck)
+            // МЧД проверяется один раз на пакет — против фактического сертификата;
+            // в каталоги документов копируется именно проверенный снимок файлов.
+            PowerOfAttorneyService.PoaPackage? poaPackage = null;
+            if (Poa is { } poa)
             {
-                var check = await Task.Run(() => PowerOfAttorneyService.Validate(poaCheck, certificate, poaVerificationOptions));
-                if (check.State == PowerOfAttorneyService.CheckState.Error)
+                var poaOptions = CreateVerificationOptions();
+                try
                 {
-                    StatusText = "Подписание остановлено — проблема с МЧД: " + check.Message;
+                    poaPackage = await Task.Run(() => PowerOfAttorneyService.Prepare(poa, certificate, poaOptions));
+                }
+                catch (Exception ex)
+                {
+                    StatusText = "Подписание остановлено — не удалось проверить МЧД: " + ex.Message;
                     return;
                 }
-                if (check.State == PowerOfAttorneyService.CheckState.Warning) Log("⚠ МЧД: " + check.Message);
+
+                if (poaPackage.Check.State == PowerOfAttorneyService.CheckState.Error)
+                {
+                    StatusText = "Подписание остановлено — проблема с МЧД: " + poaPackage.Check.Message;
+                    return;
+                }
+                if (poaPackage.Check.State == PowerOfAttorneyService.CheckState.Warning)
+                    Log("⚠ МЧД: " + poaPackage.Check.Message);
             }
             foreach (var file in Files.Where(f => f.Status != SignStatus.Signed).ToList())
             {
@@ -1194,8 +1229,8 @@ public partial class MainWindowViewModel : ObservableObject
                         StampWithDate = StampWithDate,
                         StampLogoPath = StampLogoPath,
                         StampParameters = stampParameters,
-                        PowerOfAttorney = Poa,
-                        PoaVerificationOptions = poaVerificationOptions,
+                        PowerOfAttorney = poaPackage?.Info,
+                        PreparedPowerOfAttorney = poaPackage,
                     };
                     var result = await Task.Run(
                         () => _documentSigner.SignFileAsync(file.FilePath, certificate, options));

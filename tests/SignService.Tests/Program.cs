@@ -195,7 +195,7 @@ Console.WriteLine($"stale signature excluded by name ({coSign.ExcludedSigners[0]
 
 try
 {
-    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object[] { new[] { sigStale }, payload });
+    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object?[] { new[] { sigStale }, payload, null });
     throw new Exception("expected failure when all signatures mismatch");
 }
 catch (TargetInvocationException e)
@@ -204,11 +204,19 @@ catch (TargetInvocationException e)
     Console.WriteLine("all-mismatch merge fails with clear error: OK");
 }
 
-var hashDoc = mergerType.GetMethod("HashDocument", BindingFlags.NonPublic | BindingFlags.Static)!;
-var gostHash = (byte[]?)hashDoc.Invoke(null, new object?[] { "1.2.643.7.1.1.2.2", payload });
+// Проверка подписей хеширует документ через BouncyCastle — результат должен
+// совпадать с собственным Стрибогом (им считаются signing-certificate-v2 и запрос TSA).
+var docDigests = new DocumentDigests(payload);
+var gostHash = docDigests.Get("1.2.643.7.1.1.2.2");
+var gostHash512 = docDigests.Get("1.2.643.7.1.1.2.3");
 var expected256 = (byte[])h256.Invoke(null, new object[] { payload })!;
-if (gostHash is null || !gostHash.SequenceEqual(expected256)) throw new Exception("GOST doc hash path broken");
-Console.WriteLine("GOST digest OID → Streebog-256 doc hash: OK");
+var expected512 = (byte[])h512.Invoke(null, new object[] { payload })!;
+if (gostHash is null || !gostHash.SequenceEqual(expected256)) throw new Exception("GOST-256 doc hash path broken");
+if (gostHash512 is null || !gostHash512.SequenceEqual(expected512)) throw new Exception("GOST-512 doc hash path broken");
+docDigests.Get("1.2.643.7.1.1.2.2");
+if (docDigests.Get("1.2.3.4.999") is not null) throw new Exception("unknown digest must be null");
+if (docDigests.Computations != 2) throw new Exception("document must be hashed once per algorithm");
+Console.WriteLine("GOST digest OIDs → Streebog-256/512 doc hash, one pass per algorithm: OK");
 
 // ===== 9. Извлечение из криптоконтейнера =====
 var extractDir = Path.Combine(tempRoot, "extract");

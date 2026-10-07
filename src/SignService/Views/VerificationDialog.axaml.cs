@@ -113,12 +113,15 @@ public partial class VerificationDialog : Window
         {
             var signature = await File.ReadAllBytesAsync(_signaturePath, cancellation.Token);
             var document = _documentPath is null ? null : await File.ReadAllBytesAsync(_documentPath, cancellation.Token);
-            var roots = _settings.VerificationTrustedRootPaths.Select(File.ReadAllBytes).ToArray();
+            var problems = new List<string>();
+            var settingsOptions = _settings.CreateVerificationOptions(problems);
             var crls = _evidencePaths.Where(p => p.EndsWith(".crl", StringComparison.OrdinalIgnoreCase)).Select(File.ReadAllBytes).ToArray();
             var ocsp = _evidencePaths.Where(p => !p.EndsWith(".crl", StringComparison.OrdinalIgnoreCase)).Select(File.ReadAllBytes).ToArray();
-            var result = await SignatureVerifier.VerifyAsync(signature, document, new VerificationOptions
-                { AllowNetwork = NetworkCheckBox.IsChecked == true, TrustedRoots = roots, Crls = crls, OcspResponses = ocsp }, cancellation.Token);
+            var result = await SignatureVerifier.VerifyAsync(signature, document, settingsOptions with
+                { AllowNetwork = NetworkCheckBox.IsChecked == true, Crls = crls, OcspResponses = ocsp }, cancellation.Token);
             ReportBox.Text = $"Отчёт создан: {DateTimeOffset.Now:dd.MM.yyyy HH:mm:ss zzz}\n\n"
+                + string.Concat(problems.Select(p => "⚠ " + p + "\n"))
+                + (problems.Count > 0 ? "\n" : "")
                 + result.ToReport(_signaturePath, _documentPath);
             StatusText.Text = result.CryptographicallyValid ? "Криптографическая проверка пройдена. Доверие и отзыв смотрите в отчёте."
                 : "Проверка завершена: есть ошибки или непроверенные подписи. Подробности в отчёте.";

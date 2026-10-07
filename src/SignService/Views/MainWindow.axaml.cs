@@ -271,7 +271,7 @@ public partial class MainWindow : Window
                 return;
         }
 
-        vm.SetPoa(xmlPath, sigPath);
+        await vm.SetPoaAsync(xmlPath, sigPath);
     }
 
     private async System.Threading.Tasks.Task BrowseBuildContainerAsync(MainWindowViewModel vm)

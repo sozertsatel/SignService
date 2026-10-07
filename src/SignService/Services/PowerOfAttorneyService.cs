@@ -21,8 +21,10 @@ namespace SignService.Services;
 public static class PowerOfAttorneyService
 {
     private const string SnilsOid = "1.2.643.100.3";
-    private const string InnFlOid = "1.2.643.3.131.1.1";
-    private const string InnLegacyOid = "1.2.643.100.4";
+    // ИНН: у физлица — 12 цифр; «00» + 10 цифр — прежняя запись ИНН организации.
+    private const string InnOid = "1.2.643.3.131.1.1";
+    // ИНН юридического лица (ИНН ЮЛ), 10 цифр — личным ИНН не является.
+    private const string InnLeOid = "1.2.643.100.4";
 
     /// <summary>Сведения о доверенности из XML.</summary>
     public sealed record PoaInfo(
@@ -130,6 +132,7 @@ public static class PowerOfAttorneyService
         var xml = File.ReadAllBytes(selected.XmlPath);
         var sig = File.ReadAllBytes(selected.SigPath);
         var poa = ParseBytes(xml, selected.XmlPath, selected.SigPath);
+        options ??= new VerificationOptions();
         var result = Check();
         return new PoaPackage(poa, xml, sig, result);
 
@@ -152,8 +155,7 @@ public static class PowerOfAttorneyService
             // Представитель соответствует сертификату подписанта.
             if (signerCertificate is not null)
             {
-                var certInn = Digits(SubjectValue(signerCertificate, InnFlOid))
-                    is { Length: > 0 } innFl ? innFl : Digits(SubjectValue(signerCertificate, InnLegacyOid));
+                var certInn = PersonalInn(signerCertificate);
                 var certSnils = Digits(SubjectValue(signerCertificate, SnilsOid));
                 var match = poa.Representatives.FirstOrDefault(r =>
                 {
@@ -175,14 +177,37 @@ public static class PowerOfAttorneyService
             }
             foreach (var signer in verification.Signers)
             {
-                if (signer.CertificateTrust.State == VerificationState.Invalid || signer.Revocation.State == VerificationState.Invalid)
-                    return new CheckResult(CheckState.Error, signer.CertificateTrust.Message + " " + signer.Revocation.Message);
-                if (signer.CertificateTrust.State != VerificationState.Valid || signer.Revocation.State != VerificationState.Valid)
+                var trust = signer.CertificateTrust;
+                var revocation = signer.Revocation;
+                // Срок сертификата руководителя мог истечь уже после выдачи МЧД — сама МЧД
+                // при этом продолжает действовать. Без доверенной метки TSA время подписи
+                // не доказано: проверяем сертификат на дату выдачи и предупреждаем.
+                if (trust.State == VerificationState.Invalid && signer.NotAfter < options.ValidationTime.UtcDateTime
+                    && !HasTrustedTimestamp(signer, options))
+                {
+                    var issued = poa.IssueDate!.Value;
+                    var moment = MomentOnIssueDay(issued, signer.NotBefore, signer.NotAfter);
+                    if (moment is null)
+                        return new CheckResult(CheckState.Error,
+                            $"Сертификат руководителя не действовал на дату выдачи МЧД {issued:dd.MM.yyyy} "
+                            + $"(срок сертификата {signer.NotBefore:dd.MM.yyyy} — {signer.NotAfter:dd.MM.yyyy}).");
+                    var historical = SignatureVerifier.Verify(sig, xml, options with { ValidationTime = moment.Value })
+                        .Signers.First(s => s.Number == signer.Number);
+                    trust = historical.CertificateTrust;
+                    revocation = historical.Revocation;
+                    warnings.Add($"Сертификат руководителя истёк {signer.NotAfter:dd.MM.yyyy} — после выдачи МЧД "
+                        + $"{issued:dd.MM.yyyy}; на дату выдачи он действовал. Время подписи МЧД не подтверждено "
+                        + "меткой TSA — убедитесь, что МЧД зарегистрирована и не отозвана в реестре ФНС.");
+                }
+
+                if (trust.State == VerificationState.Invalid || revocation.State == VerificationState.Invalid)
+                    return new CheckResult(CheckState.Error, trust.Message + " " + revocation.Message);
+                if (trust.State != VerificationState.Valid || revocation.State != VerificationState.Valid)
                     warnings.Add("Доверие или отзыв сертификата руководителя не подтверждены.");
                 var principalInn = Digits(poa.PrincipalInn);
                 var cert = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(signer.Certificate!);
-                var innValues = cert.SubjectDN.GetValueList(new Org.BouncyCastle.Asn1.DerObjectIdentifier(InnLegacyOid));
-                if (innValues.Count > 0 && principalInn.Length > 0 && innValues.Any(v => Digits(v) != principalInn))
+                var innValues = OrganizationInns(cert);
+                if (innValues.Count > 0 && principalInn.Length > 0 && innValues.Any(v => v != principalInn))
                     return new CheckResult(CheckState.Error, "ИНН организации в сертификате руководителя не совпадает с доверителем МЧД.");
                 if (innValues.Count == 0 || principalInn.Length == 0)
                     warnings.Add("Связь сертификата руководителя с организацией-доверителем не подтверждена по ИНН.");
@@ -236,6 +261,46 @@ public static class PowerOfAttorneyService
             throw new IOException("Имена файлов МЧД совпадают с документом или его подписью.");
         yield return (xmlTarget, package.Xml);
         yield return (sigTarget, package.Signature);
+    }
+
+    // Метка TSA, которой можно верить, сама задаёт момент проверки сертификата.
+    private static bool HasTrustedTimestamp(SignerVerification signer, VerificationOptions options) =>
+        options.CheckCertificateTrust && signer.Timestamp.State == VerificationState.Valid && signer.TimestampTime is not null;
+
+    /// <summary>
+    /// Момент дня выдачи МЧД, когда сертификат действовал; null — не действовал.
+    /// Дата МЧД — без времени и пояса, поэтому день берётся с запасом на часовые
+    /// пояса РФ (UTC+2…UTC+12): с 12:00 UTC предыдущего дня до 22:00 UTC этого.
+    /// </summary>
+    internal static DateTimeOffset? MomentOnIssueDay(DateTime issueDate, DateTime notBefore, DateTime notAfter)
+    {
+        var dayStart = new DateTimeOffset(DateTime.SpecifyKind(issueDate.Date, DateTimeKind.Utc)).AddHours(-12);
+        var dayEnd = dayStart.AddHours(34);
+        var validFrom = new DateTimeOffset(DateTime.SpecifyKind(notBefore, DateTimeKind.Utc));
+        var validTo = new DateTimeOffset(DateTime.SpecifyKind(notAfter, DateTimeKind.Utc));
+        var from = validFrom > dayStart ? validFrom : dayStart;
+        var to = validTo < dayEnd ? validTo : dayEnd;
+        return from <= to ? from + (to - from) / 2 : null;
+    }
+
+    /// <summary>
+    /// Личный ИНН владельца сертификата (ИНН ФЛ): только 12 цифр из 1.2.643.3.131.1.1.
+    /// ИНН организации (1.2.643.100.4 или «00» + ИНН ЮЛ) личным не считается.
+    /// </summary>
+    private static string PersonalInn(X509Certificate2 certificate)
+    {
+        var inn = Digits(SubjectValue(certificate, InnOid));
+        return inn.Length == 12 && !inn.StartsWith("00", StringComparison.Ordinal) ? inn : "";
+    }
+
+    /// <summary>ИНН организации в сертификате: 1.2.643.100.4 и прежняя запись «00» + ИНН ЮЛ.</summary>
+    private static List<string> OrganizationInns(Org.BouncyCastle.X509.X509Certificate certificate)
+    {
+        var subject = certificate.SubjectDN;
+        return subject.GetValueList(new Org.BouncyCastle.Asn1.DerObjectIdentifier(InnLeOid)).Select(Digits)
+            .Concat(subject.GetValueList(new Org.BouncyCastle.Asn1.DerObjectIdentifier(InnOid)).Select(Digits)
+                .Where(v => v.Length == 12 && v.StartsWith("00", StringComparison.Ordinal)).Select(v => v[2..]))
+            .Where(v => v.Length > 0).Distinct().ToList();
     }
 
     /// <summary>Значение RDN субъекта сертификата по OID (СНИЛС/ИНН и т.п.).</summary>

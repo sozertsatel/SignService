@@ -68,6 +68,12 @@ public class DocumentSigner
         public PowerOfAttorneyService.PoaInfo? PowerOfAttorney { get; init; }
 
         public VerificationOptions? PoaVerificationOptions { get; init; }
+
+        /// <summary>
+        /// МЧД, уже проверенная для этого сертификата (один раз на пакет файлов):
+        /// повторная полная проверка не выполняется, копируется именно этот снимок.
+        /// </summary>
+        internal PowerOfAttorneyService.PoaPackage? PreparedPowerOfAttorney { get; init; }
     }
 
     /// <summary>
@@ -121,8 +127,8 @@ public class DocumentSigner
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var poaPackage = options.PowerOfAttorney is { } selectedPoa
-            ? PowerOfAttorneyService.Prepare(selectedPoa, certificate, options.PoaVerificationOptions) : null;
+        var poaPackage = options.PreparedPowerOfAttorney ?? (options.PowerOfAttorney is { } selectedPoa
+            ? PowerOfAttorneyService.Prepare(selectedPoa, certificate, options.PoaVerificationOptions) : null);
         if (poaPackage?.Check.State == PowerOfAttorneyService.CheckState.Error)
             throw new InvalidOperationException(poaPackage.Check.Message);
         if (poaPackage is not null) PowerOfAttorneyService.CheckCopyTargets(poaPackage, filePath);
@@ -195,9 +201,8 @@ public class DocumentSigner
         {
             // Объединение с проверкой: подписи под другим файлом или прежней версией
             // документа исключаются — иначе портал отклонит весь контейнер.
-            var merged = CmsMerger.MergeForDocument(inputs, data);
-            output = options.Detached ? CmsMerger.ConvertToDetached(merged.Signature)
-                : CmsMerger.AttachContent(merged.Signature, data);
+            var merged = CmsMerger.MergeForDocument(inputs, data, attach: !options.Detached);
+            output = merged.Signature;
             signerCount = merged.SignerCount;
             excluded = merged.ExcludedSigners;
             unverified = merged.UnverifiedSigners;

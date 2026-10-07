@@ -170,8 +170,8 @@ public static class CmsExtractor
                     $"Рядом с документом нет файла «{Path.GetFileName(documentPath)}.sig» — выберите подписи вручную.");
 
         var inputs = paths.Select(File.ReadAllBytes).ToList();
-        var merged = CmsMerger.MergeForDocument(inputs, document);
-        var container = CmsMerger.AttachContent(merged.Signature, document);
+        var merged = CmsMerger.MergeForDocument(inputs, document, attach: true);
+        var container = merged.Signature;
 
         var directory = Path.GetDirectoryName(documentPath) ?? ".";
         var outputPath = UniquePath(
