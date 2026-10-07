@@ -30,6 +30,12 @@ public partial class SignFileItem : ObservableObject
 
     public string FilePath { get; }
 
+    /// <summary>
+    /// Модель окна, в очереди которой стоит файл: из контекстного меню файла
+    /// (всплывающее окно вне дерева элементов) команды доступны только через неё.
+    /// </summary>
+    public MainWindowViewModel? Owner { get; init; }
+
     public string FileName { get; }
 
     public string SizeDisplay { get; }

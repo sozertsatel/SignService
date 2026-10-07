@@ -135,35 +135,37 @@
                                 <Border Margin="0,2" Padding="10,6" CornerRadius="6"
                                         Background="{DynamicResource SystemControlBackgroundListLowBrush}">
                                     <Border.ContextMenu>
+                                        <!-- Меню — всплывающее окно вне визуального дерева: $parent[...] здесь
+                                             не находит список, поэтому команды берутся у владельца элемента. -->
                                         <ContextMenu>
                                             <MenuItem Header="Подписанты и проверка ЭЦП…"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).InspectSignaturesCommand}"
+                                                      Command="{Binding Owner.InspectSignaturesCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Приложить подписи других лиц (＋.sig)…"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).AttachSignaturesCommand}"
+                                                      Command="{Binding Owner.AttachSignaturesCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <Separator/>
                                             <MenuItem Header="Штамп на PDF (копия без подписи)…"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).StampItemCommand}"
+                                                      Command="{Binding Owner.StampItemCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Извлечь из контейнера (.sig рядом)"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).ExtractItemCommand}"
+                                                      Command="{Binding Owner.ExtractItemCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Собрать контейнер (документ + .sig рядом)"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).BuildContainerItemCommand}"
+                                                      Command="{Binding Owner.BuildContainerItemCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Разделить групповую подпись (.sig рядом)"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).SplitItemCommand}"
+                                                      Command="{Binding Owner.SplitItemCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Исключить подписанта из .sig…"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).RemoveSignerItemCommand}"
+                                                      Command="{Binding Owner.RemoveSignerItemCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <Separator/>
                                             <MenuItem Header="Открыть папку файла"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).OpenFolderCommand}"
+                                                      Command="{Binding Owner.OpenFolderCommand}"
                                                       CommandParameter="{Binding}"/>
                                             <MenuItem Header="Убрать из списка"
-                                                      Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).RemoveFileCommand}"
+                                                      Command="{Binding Owner.RemoveFileCommand}"
                                                       CommandParameter="{Binding}"/>
                                         </ContextMenu>
                                     </Border.ContextMenu>
@@ -188,13 +190,13 @@
                                                    TextTrimming="CharacterEllipsis" MaxWidth="320"
                                                    ToolTip.Tip="{Binding StatusDisplay}"/>
                                         <Button Grid.Column="4" Margin="8,0,0,0" Padding="6,2"
-                                                Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).AttachSignaturesCommand}"
+                                                Command="{Binding Owner.AttachSignaturesCommand}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip.Tip="Приложить подписи других лиц (.sig) — они будут объединены с вашей в один файл">
                                             <TextBlock Text="＋.sig"/>
                                         </Button>
                                         <Button Grid.Column="5" Margin="4,0,0,0" Padding="6,2"
-                                                Command="{Binding $parent[ItemsControl].((vm:MainWindowViewModel)DataContext).RemoveFileCommand}"
+                                                Command="{Binding Owner.RemoveFileCommand}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip.Tip="Убрать из списка">
                                             <TextBlock Text="✕"/>

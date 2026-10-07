@@ -722,7 +722,7 @@ public partial class MainWindowViewModel : ObservableObject
             if (Files.Any(f => string.Equals(f.FilePath, path, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
-            Files.Add(new SignFileItem(path));
+            Files.Add(new SignFileItem(path) { Owner = this });
             added++;
         }
 

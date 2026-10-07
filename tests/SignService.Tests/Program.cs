@@ -803,6 +803,7 @@ Console.WriteLine("verify: text report format: OK");
 
 await VerificationTests.RunAsync(tempRoot);
 await ReviewRegressionTests.RunAsync(tempRoot, signer);
+UiSmokeTests.Run(tempRoot);
 try { Directory.Delete(tempRoot, true); } catch { }
 Console.WriteLine("ALL TESTS PASSED");
 return 0;
