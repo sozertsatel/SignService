@@ -439,6 +439,9 @@ public partial class SignFileItem : ObservableObject
                 : "Нет подходящей подписи — будет создан новый файл. Режим «Добавить к существующей», как у первого файла, здесь недоступен.";
         if (SignsStampedCopy)
             return fallback;
+        if (fallback is null && _followingShared && !_sharedWantsAdd && _discovered.Count > 0)
+            fallback = "Режим «Создать новую», как у первого файла. Найденные подписи не будут объединены: "
+                + string.Join(", ", _discovered.Select(match => "«" + Path.GetFileName(match.Path) + "»")) + ".";
         var names = PlannedDiscovered().SelectMany(match => match.MismatchedSignerNames).Distinct().ToList();
         var discovery = names.Count == 0
             ? null

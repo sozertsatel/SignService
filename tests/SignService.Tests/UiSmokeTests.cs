@@ -62,6 +62,7 @@ internal static class UiSmokeTests
         Assert(Math.Abs(browseAt.Y - toolsAt.Y) < 4 && Math.Abs(browseAt.Y - clearAt.Y) < 4,
             "browse, tools and clear must share one row");
         Assert(toolsAt.X > browseAt.X && clearAt.X > toolsAt.X, "clear must stay on the right of tools");
+        AssertSignButtonOnTheRight(window, dropAt.Y, clear);
         var labels = window.GetVisualDescendants().OfType<TextBlock>().Select(block => block.Text).ToList();
         Assert(labels.Any(text => text != null && text.StartsWith("Версия ", StringComparison.Ordinal)),
             "main window must show the version");
@@ -163,6 +164,9 @@ internal static class UiSmokeTests
             "co-sign choice must list the found signature and «create new»");
         var texts = window.GetVisualDescendants().OfType<TextBlock>().Select(text => text.Text ?? "").ToList();
         Assert(texts.Any(text => text.Contains("будет добавлена подпись №2")), "plan line must be shown");
+        var drop = window.GetVisualDescendants().OfType<Border>().First(b => b.Name == "DropZone");
+        var clear = window.GetVisualDescendants().OfType<Button>().First(b => b.Content?.ToString() == "Очистить список");
+        AssertSignButtonOnTheRight(window, drop.TranslatePoint(new Point(0, 0), window)!.Value.Y, clear);
         vm.IsBusy = true;
         Dispatcher.UIThread.RunJobs();
         Assert(!combo.IsEnabled, "co-sign choice must be locked while signing");
@@ -173,6 +177,18 @@ internal static class UiSmokeTests
         frame.Save(shot);
         frame.Dispose();
         window.Close();
+    }
+
+    private static void AssertSignButtonOnTheRight(MainWindow window, double dropY, Button clear)
+    {
+        var sign = window.GetVisualDescendants().OfType<Button>().First(b => b.Content?.ToString() == "Подписать");
+        var signAt = sign.TranslatePoint(new Point(0, 0), window)!.Value;
+        var signRight = sign.TranslatePoint(new Point(sign.Bounds.Width, 0), window)!.Value.X;
+        var clearAt = clear.TranslatePoint(new Point(0, 0), window)!.Value;
+        var clearRight = clear.TranslatePoint(new Point(clear.Bounds.Width, 0), window)!.Value.X;
+        Assert(signAt.Y > dropY, $"sign button must stay below the file list (sign {signAt.Y}, list {dropY})");
+        Assert(Math.Abs(signRight - clearRight) < 2, $"sign button must share the right edge with clear ({signRight} vs {clearRight})");
+        Assert(signAt.X > clearAt.X, "sign button must sit on the right side");
     }
 
     private static void Assert(bool value, string message)

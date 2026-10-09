@@ -265,16 +265,17 @@
             </Panel>
         </Border>
 
-        <!-- Подписание -->
-        <StackPanel Grid.Row="5" Orientation="Horizontal" Spacing="8" Margin="0,12,0,0">
-            <Button Content="Подписать"
+        <!-- Подписание: та же вертикаль, кнопка у правого края, как «Очистить список» -->
+        <Grid Grid.Row="5" ColumnDefinitions="*,Auto,Auto" Margin="0,12,0,0">
+            <ProgressBar Grid.Column="1" IsIndeterminate="True" Width="120"
+                         Margin="0,0,8,0" IsVisible="{Binding IsBusy}" VerticalAlignment="Center"/>
+            <Button Grid.Column="2" Content="Подписать"
                     Command="{Binding SignAllCommand}"
                     Classes="accent"
                     FontWeight="SemiBold"
-                    Padding="24,6"/>
-            <ProgressBar IsIndeterminate="True" Width="120"
-                         IsVisible="{Binding IsBusy}" VerticalAlignment="Center"/>
-        </StackPanel>
+                    Padding="24,6"
+                    HorizontalAlignment="Right"/>
+        </Grid>
 
         <!-- Лог операций (всегда виден) -->
         <Grid Grid.Row="6" RowDefinitions="Auto,Auto" Margin="0,8,0,0">

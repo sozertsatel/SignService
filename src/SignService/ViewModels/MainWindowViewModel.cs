@@ -1356,6 +1356,8 @@ public partial class MainWindowViewModel : ObservableObject
                 }
             }
 
+            WarnIfEmbeddedDocumentDropped(file, blocks);
+
             var inputs = file.PlannedMergeInputs();
             if (inputs.Count == 0)
                 continue;
@@ -1380,6 +1382,38 @@ public partial class MainWindowViewModel : ObservableObject
         if (blocks.Count == 0)
             return null;
         return string.Join("\n\n", blocks) + "\n\nПродолжить?";
+    }
+
+    // Прикреплённая подпись хранит копию документа внутри. Откреплённый режим
+    // или другая копия документа эту копию затирают — предупреждаем до записи.
+    private void WarnIfEmbeddedDocumentDropped(SignFileItem file, List<string> blocks)
+    {
+        if (file.SignsStampedCopy || file.SelectedCoSignOption is not { CreateNew: false, SignaturePath: { } path })
+            return;
+        if (!System.IO.File.Exists(path))
+            return;
+        try
+        {
+            var embedded = CmsMerger.ExtractContent(System.IO.File.ReadAllBytes(path));
+            if (embedded is null)
+                return;
+            var name = System.IO.Path.GetFileName(path);
+            if (IsDetached)
+            {
+                blocks.Add($"«{file.FileName}»: «{name}» — прикреплённая подпись, внутри лежит копия документа. "
+                    + "Откреплённый режим уберёт её из файла (подписанты сохранятся, перед заменой создаётся резервная копия).");
+                return;
+            }
+
+            var document = System.IO.File.ReadAllBytes(file.FilePath);
+            if (!embedded.AsSpan().SequenceEqual(document))
+                blocks.Add($"«{file.FileName}»: в «{name}» вложен другой документ. Он будет заменён текущим файлом "
+                    + "(перед заменой создаётся резервная копия).");
+        }
+        catch (Exception e)
+        {
+            blocks.Add($"«{file.FileName}»: не удалось проверить, есть ли внутри подписи копия документа ({e.Message}).");
+        }
     }
 
     [RelayCommand(CanExecute = nameof(CanSignAll))]
