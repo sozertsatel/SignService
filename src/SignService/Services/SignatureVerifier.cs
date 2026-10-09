@@ -46,7 +46,12 @@ public static class SignatureVerifier
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
+            // КриптоПро и CryptoAPI записывают в signatureAlgorithm параметры ГОСТ-ключа,
+            // а BouncyCastle такие подписи не принимает. Проверяется копия без этих
+            // параметров: значение подписи и подписанные атрибуты не меняются, все
+            // проверки (messageDigest, content-type, значение подписи) выполняются полностью.
             var normalized = CmsMerger.Normalize(signature);
+            normalized = CmsMerger.WithoutGostSignatureParameters(normalized) ?? normalized;
             var original = new CmsSignedData(normalized);
             var attached = original.SignedContent is not null;
             var embedded = attached ? CmsMerger.ExtractContent(normalized) : null;
@@ -164,10 +169,15 @@ public static class SignatureVerifier
     {
         try
         {
-            var attr = signer.SignedAttributes?[PkcsObjectIdentifiers.Pkcs9AtMessageDigest];
-            if (attr is null)
+            var signedAttributes = signer.SignedAttributes;
+            if (signedAttributes is null)
                 return VerificationCheck.Valid("Документ проверяется непосредственно значением подписи (без signedAttrs).");
-            if (attr.AttrValues.Count != 1)
+            // С подписанными атрибутами документ связан с подписью только через messageDigest.
+            var digestAttributes = signedAttributes.GetAll(PkcsObjectIdentifiers.Pkcs9AtMessageDigest);
+            if (digestAttributes.Count == 0)
+                return VerificationCheck.Invalid("В подписанных атрибутах нет messageDigest: подпись не связана с содержимым документа.");
+            var attr = CmsAttribute.GetInstance(digestAttributes[0]);
+            if (digestAttributes.Count != 1 || attr.AttrValues.Count != 1)
                 return VerificationCheck.Invalid("Некорректный атрибут messageDigest.");
             var digest = Asn1OctetString.GetInstance(attr.AttrValues[0]).GetOctets();
             var actual = document.Get(signer.DigestAlgorithmID.Algorithm.Id);

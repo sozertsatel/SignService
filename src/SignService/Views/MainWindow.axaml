@@ -4,8 +4,8 @@
         x:Class="SignService.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="SignService — подписание документов ЭЦП"
-        Width="860" Height="600"
-        MinWidth="640" MinHeight="480"
+        Width="980" Height="720"
+        MinWidth="760" MinHeight="520"
         WindowStartupLocation="CenterScreen"
         DragDrop.AllowDrop="True">
 
@@ -68,10 +68,14 @@
             <RadioButton GroupName="SigMode" Margin="0,0,16,4"
                          IsChecked="{Binding !IsDetached}"
                          Content="Прикреплённая (документ внутри .sig)"/>
-            <CheckBox Margin="0,0,16,4"
-                      IsChecked="{Binding MergeWithExisting}"
-                      Content="Объединять с существующей .sig"
-                      ToolTip.Tip="Соподписание: если рядом с документом уже есть .sig, ваша подпись добавится к имеющимся подписантам, а не заменит их. Подписи других лиц можно также приложить кнопкой «＋.sig» у файла."/>
+            <RadioButton GroupName="CoSignMode" Margin="0,0,16,4"
+                         IsChecked="{Binding MergeWithExisting}"
+                         Content="Добавить к существующей подписи"
+                         ToolTip.Tip="Соподписание. При добавлении документа программа ищет в той же папке файлы .sig, .p7s и .p7m, относящиеся к нему по содержимому, даже если имя файла другое. Ваша подпись дописывается в выбранный файл, прежние подписанты сохраняются. Файл виден в строке документа."/>
+            <RadioButton GroupName="CoSignMode" Margin="0,0,16,4"
+                         IsChecked="{Binding !MergeWithExisting}"
+                         Content="Создать новую"
+                         ToolTip.Tip="Будет создан новый файл «документ.sig». Если в папке уже есть подходящая подпись или существующий файл будет заменён без объединения — программа спросит подтверждение; перед заменой сохраняется резервная копия."/>
             <CheckBox Margin="0,0,16,4"
                       IsChecked="{Binding IncludeExpiredCertificates}"
                       Content="Показывать просроченные сертификаты"/>
@@ -169,38 +173,58 @@
                                                       CommandParameter="{Binding}"/>
                                         </ContextMenu>
                                     </Border.ContextMenu>
-                                    <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto">
-                                        <StackPanel Grid.Column="0" Spacing="2">
-                                            <TextBlock Text="{Binding FileName}" FontWeight="SemiBold"
-                                                       TextTrimming="CharacterEllipsis"/>
-                                            <TextBlock Text="{Binding FilePath}" FontSize="11"
-                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                                       TextTrimming="CharacterEllipsis"/>
+                                    <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+                                        <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding FileName}" FontWeight="SemiBold"
+                                                   TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding ExtraDisplay}"
+                                                       IsVisible="{Binding HasExtra}"
+                                                       VerticalAlignment="Center" Margin="8,0"
+                                                       Foreground="{DynamicResource SystemAccentColor}"
+                                                       ToolTip.Tip="Приложенные подписи других лиц будут объединены с вашей в один .sig"/>
+                                            <TextBlock Text="{Binding SizeDisplay}"
+                                                       VerticalAlignment="Center" Margin="8,0"
+                                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                                            <Button Margin="8,0,0,0" Padding="6,2"
+                                                    Command="{Binding Owner.AttachSignaturesCommand}"
+                                                    CommandParameter="{Binding}"
+                                                    ToolTip.Tip="Приложить подписи других лиц (.sig, .p7s). Если подпись относится к этому документу, она находится и по хешу, не только по имени.">
+                                                <TextBlock Text="＋.sig"/>
+                                            </Button>
+                                            <Button Margin="4,0,0,0" Padding="6,2"
+                                                    Command="{Binding Owner.RemoveFileCommand}"
+                                                    CommandParameter="{Binding}"
+                                                    ToolTip.Tip="Убрать из списка">
+                                                <TextBlock Text="✕"/>
+                                            </Button>
                                         </StackPanel>
-                                        <TextBlock Grid.Column="1" Text="{Binding ExtraDisplay}"
-                                                   IsVisible="{Binding HasExtra}"
-                                                   VerticalAlignment="Center" Margin="8,0"
-                                                   Foreground="{DynamicResource SystemAccentColor}"
-                                                   ToolTip.Tip="Приложенные подписи других лиц будут объединены с вашей в один .sig"/>
-                                        <TextBlock Grid.Column="2" Text="{Binding SizeDisplay}"
-                                                   VerticalAlignment="Center" Margin="8,0"
-                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                                        <TextBlock Grid.Column="3" Text="{Binding StatusDisplay}"
-                                                   VerticalAlignment="Center" Margin="8,0"
-                                                   TextTrimming="CharacterEllipsis" MaxWidth="320"
+                                        <TextBlock Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2"
+                                                   Text="{Binding FilePath}" FontSize="11"
+                                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                        <ComboBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2"
+                                                  Margin="0,4,0,0" HorizontalAlignment="Left"
+                                                  MinWidth="280" MaxWidth="560"
+                                                  ItemsSource="{Binding CoSignOptions}"
+                                                  SelectedItem="{Binding SelectedCoSignOption}"
+                                                  IsEnabled="{Binding CanChooseCoSign}"
+                                                  ToolTip.Tip="{Binding SelectedCoSignOption.Label}">
+                                            <ComboBox.ItemTemplate>
+                                                <DataTemplate x:DataType="vm:CoSignOption">
+                                                    <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"/>
+                                                </DataTemplate>
+                                            </ComboBox.ItemTemplate>
+                                        </ComboBox>
+                                        <TextBlock Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2"
+                                                   Margin="0,4,0,0" Text="{Binding StatusDisplay}"
+                                                   TextWrapping="Wrap" FontSize="12"
                                                    ToolTip.Tip="{Binding StatusDisplay}"/>
-                                        <Button Grid.Column="4" Margin="8,0,0,0" Padding="6,2"
-                                                Command="{Binding Owner.AttachSignaturesCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Приложить подписи других лиц (.sig) — они будут объединены с вашей в один файл">
-                                            <TextBlock Text="＋.sig"/>
-                                        </Button>
-                                        <Button Grid.Column="5" Margin="4,0,0,0" Padding="6,2"
-                                                Command="{Binding Owner.RemoveFileCommand}"
-                                                CommandParameter="{Binding}"
-                                                ToolTip.Tip="Убрать из списка">
-                                            <TextBlock Text="✕"/>
-                                        </Button>
+                                        <TextBlock Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="2"
+                                                   Margin="0,2,0,0" Text="{Binding WarningDisplay}"
+                                                   TextWrapping="Wrap" FontSize="12" FontWeight="SemiBold"
+                                                   Foreground="#C2410C"
+                                                   IsVisible="{Binding HasWarning}"
+                                                   ToolTip.Tip="{Binding WarningDisplay}"/>
                                     </Grid>
                                 </Border>
                             </DataTemplate>
