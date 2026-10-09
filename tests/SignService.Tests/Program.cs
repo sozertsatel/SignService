@@ -195,7 +195,7 @@ Console.WriteLine($"stale signature excluded by name ({coSign.ExcludedSigners[0]
 
 try
 {
-    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object?[] { new[] { sigStale }, payload, null });
+    mergerType.GetMethod("MergeForDocument")!.Invoke(null, new object?[] { new[] { sigStale }, payload, null, true });
     throw new Exception("expected failure when all signatures mismatch");
 }
 catch (TargetInvocationException e)
@@ -462,9 +462,12 @@ mCms2.CheckSignature(verifySignatureOnly: true);
 if (!mCms2.ContentInfo.Content.AsSpan().SequenceEqual(payload)) throw new Exception("attached merge lost document");
 Console.WriteLine("merge w/o signing (attached + detached): attached output, doc preserved, 2 signers verify");
 
-// в) документа нет — механическое объединение с пометкой
-var q1 = Path.Combine(mDir, "неизвестно1.sig");
-var q2 = Path.Combine(mDir, "неизвестно2.sig");
+// в) документа нет — механическое объединение с пометкой.
+// Отдельный каталог: иначе поиск по хешу нашёл бы «справка.pdf» из пункта (а).
+var noDocDir = Path.Combine(mDir, "без_документа");
+Directory.CreateDirectory(noDocDir);
+var q1 = Path.Combine(noDocDir, "неизвестно1.sig");
+var q2 = Path.Combine(noDocDir, "неизвестно2.sig");
 await File.WriteAllBytesAsync(q1, sigA);
 await File.WriteAllBytesAsync(q2, sigC);
 var mr3 = CmsExtractor.MergeSignatureFiles(new[] { q1, q2 });
@@ -803,6 +806,7 @@ Console.WriteLine("verify: text report format: OK");
 
 await VerificationTests.RunAsync(tempRoot);
 await ReviewRegressionTests.RunAsync(tempRoot, signer);
+await CoSignTests.RunAsync(tempRoot, signer);
 UiSmokeTests.Run(tempRoot);
 try { Directory.Delete(tempRoot, true); } catch { }
 Console.WriteLine("ALL TESTS PASSED");

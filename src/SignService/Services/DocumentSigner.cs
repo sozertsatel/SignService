@@ -31,6 +31,13 @@ public class DocumentSigner
         /// <summary>Пути к .sig других подписантов для объединения.</summary>
         public IReadOnlyList<string> ExtraSignatures { get; init; } = Array.Empty<string>();
 
+        /// <summary>
+        /// Существующий файл подписи, в который добавляется своя. Если задан,
+        /// результат записывается в него (а не в «документ.sig»): так сохраняется
+        /// файл с нестандартным именем, найденный по хешу документа.
+        /// </summary>
+        public string? ExistingSignaturePath { get; init; }
+
         /// <summary>Добавлять ли штамп времени TSA (CAdES-T) в подпись.</summary>
         public bool Timestamp { get; init; }
 
@@ -88,7 +95,10 @@ public class DocumentSigner
         int SignerCount,
         IReadOnlyList<string> ExcludedSigners,
         IReadOnlyList<string> UnverifiedSigners,
-        string? StampedCopyPath = null);
+        string? StampedCopyPath = null,
+        int PreviousSignerCount = 0,
+        bool AppendedToExisting = false,
+        string? BackupPath = null);
 
     private readonly TimestampClient _timestampClient = new();
 
@@ -161,7 +171,12 @@ public class DocumentSigner
         }
 
         var data = await File.ReadAllBytesAsync(targetPath, cancellationToken);
-        var signaturePath = targetPath + ".sig";
+        var canonicalSignaturePath = targetPath + ".sig";
+        var signaturePath = options.MergeWithExisting
+            && !string.IsNullOrWhiteSpace(options.ExistingSignaturePath)
+            && File.Exists(options.ExistingSignaturePath)
+            ? options.ExistingSignaturePath
+            : canonicalSignaturePath;
 
         // Свою подпись создаём ДО чтения объединяемых файлов, чтобы ошибка
         // подписания не оставила .sig наполовину обработанным.
@@ -179,12 +194,38 @@ public class DocumentSigner
             own = CmsMerger.AddUnsignedAttribute(own, TimestampClient.TimeStampTokenOid, token);
         }
 
-        var inputs = new List<byte[]>();
-        if (options.MergeWithExisting && File.Exists(signaturePath))
-            inputs.Add(await File.ReadAllBytesAsync(signaturePath, cancellationToken));
+        var inputPaths = new List<string>();
+        void AddInputPath(string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return;
+            if (inputPaths.Any(existing => string.Equals(
+                    Path.GetFullPath(existing), Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase)))
+                return;
+            inputPaths.Add(path);
+        }
+
+        if (options.MergeWithExisting)
+        {
+            if (!string.IsNullOrWhiteSpace(options.ExistingSignaturePath))
+                AddInputPath(options.ExistingSignaturePath);
+            else
+                AddInputPath(canonicalSignaturePath);
+        }
+
         foreach (var path in options.ExtraSignatures)
+            AddInputPath(path);
+
+        var inputs = new List<byte[]>();
+        foreach (var path in inputPaths)
             inputs.Add(await File.ReadAllBytesAsync(path, cancellationToken));
         inputs.Add(own); // своя — последней: при совпадении подписанта она побеждает
+
+        var appended = inputPaths.Any(path => string.Equals(
+            Path.GetFullPath(path), Path.GetFullPath(signaturePath), StringComparison.OrdinalIgnoreCase));
+        var previousSignerCount = appended
+            ? CmsMerger.CountSigners(await File.ReadAllBytesAsync(signaturePath, cancellationToken))
+            : 0;
 
         int signerCount;
         IReadOnlyList<string> excluded;
@@ -212,6 +253,10 @@ public class DocumentSigner
         if (!(await File.ReadAllBytesAsync(targetPath, cancellationToken)).AsSpan().SequenceEqual(data))
             throw new IOException("Документ изменился во время подписания. Подпись не сохранена; повторите операцию.");
         if (poaPackage is not null) PowerOfAttorneyService.CopyPackage(poaPackage, targetPath);
+        // Существующий .sig не затирается молча: рядом остаётся копия с отметкой времени.
+        string? backupPath = null;
+        if (File.Exists(signaturePath))
+            backupPath = SignatureBackup.Create(signaturePath);
         await AtomicFile.WriteAsync(signaturePath, output, overwrite: true, cancellationToken);
 
         // Режим «копия отдельно»: штампованная копия БЕЗ подписи, со всеми
@@ -239,7 +284,8 @@ public class DocumentSigner
         }
 
         return new SignFileResult(
-            targetPath, signaturePath, signerCount, excluded, unverified, stampedCopyPath);
+            targetPath, signaturePath, signerCount, excluded, unverified, stampedCopyPath,
+            previousSignerCount, appended, backupPath);
     }
 
     /// <summary>

@@ -80,9 +80,11 @@ public static class CmsExtractor
 
         var inputs = paths.Select(File.ReadAllBytes).ToList();
 
-        // Документ: из прикреплённого контейнера либо из файла рядом с .sig.
+        // Документ: из прикреплённого контейнера, из файла «имя.sig» → «имя»
+        // либо — если имя подписи нестандартное — по хешу содержимого в том же каталоге.
         byte[]? document = null;
         string documentNote = "";
+        string? knownDocumentName = null;
         foreach (var input in inputs)
         {
             var content = CmsMerger.ExtractContent(input);
@@ -98,15 +100,25 @@ public static class CmsExtractor
         {
             foreach (var path in paths)
             {
-                if (!path.EndsWith(".sig", StringComparison.OrdinalIgnoreCase))
+                var documentPath = SignatureDiscovery.SiblingDocumentPath(path);
+                if (documentPath is null || !File.Exists(documentPath))
                     continue;
-                var documentPath = path[..^4];
-                if (File.Exists(documentPath))
-                {
-                    document = File.ReadAllBytes(documentPath);
-                    documentNote = $"проверено по документу «{Path.GetFileName(documentPath)}»";
-                    break;
-                }
+                document = File.ReadAllBytes(documentPath);
+                knownDocumentName = Path.GetFileName(documentPath);
+                documentNote = $"проверено по документу «{knownDocumentName}»";
+                break;
+            }
+        }
+
+        var directory = Path.GetDirectoryName(paths[0]) ?? ".";
+        if (document is null)
+        {
+            var found = SignatureDiscovery.FindDocumentByContent(directory, paths);
+            if (found is not null)
+            {
+                document = File.ReadAllBytes(found);
+                knownDocumentName = Path.GetFileName(found);
+                documentNote = $"проверено по документу «{knownDocumentName}» (найден по хешу содержимого, не по имени файла подписи)";
             }
         }
 
@@ -128,7 +140,6 @@ public static class CmsExtractor
 
         var info = CmsMerger.Inspect(merged);
 
-        var directory = Path.GetDirectoryName(paths[0]) ?? ".";
         var firstName = Path.GetFileName(paths[0]);
         var baseName = firstName.EndsWith(".sig", StringComparison.OrdinalIgnoreCase)
                     || firstName.EndsWith(".p7s", StringComparison.OrdinalIgnoreCase)
@@ -136,7 +147,14 @@ public static class CmsExtractor
             ? firstName[..^4]
             : firstName;
 
-        var outputPath = UniquePath(directory, $"{baseName} (объединённая).sig", paths);
+        // Документ известен — результат называется «документ.sig», а не повторяет
+        // странное имя входного файла. Существующий файл с таким именем не затирается.
+        var desiredName = knownDocumentName is not null
+            ? knownDocumentName + ".sig"
+            : $"{baseName} (объединённая).sig";
+        var outputPath = UniquePath(directory, desiredName, paths);
+        if (!string.Equals(Path.GetFileName(outputPath), desiredName, StringComparison.OrdinalIgnoreCase))
+            documentNote += $" Существующий файл «{desiredName}» не перезаписан, результат записан в «{Path.GetFileName(outputPath)}».";
         AtomicFile.Write(outputPath, merged);
 
         return new MergeFilesResult(

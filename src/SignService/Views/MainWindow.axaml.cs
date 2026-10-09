@@ -152,14 +152,13 @@ public partial class MainWindow : Window
             },
         });
 
-        var added = item.AttachSignatures(files
+        var paths = files
             .Select(f => f.TryGetLocalPath())
             .Where(p => p is not null)
             .Select(p => p!)
-            .ToList());
-
-        if (added > 0 && DataContext is MainWindowViewModel vm)
-            vm.StatusText = $"Приложено подписей к «{item.FileName}»: {added} (всего: {item.ExtraCount})";
+            .ToList();
+        if (DataContext is MainWindowViewModel vm)
+            vm.AttachSignatureFiles(item, paths);
     }
 
     private async System.Threading.Tasks.Task BrowseLogoAsync(MainWindowViewModel vm)

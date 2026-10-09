@@ -292,10 +292,14 @@ public partial class MainWindowViewModel : ObservableObject
 
     partial void OnMergeWithExistingChanged(bool value)
     {
-        if (_initializing)
-            return;
-        _settings.MergeWithExisting = value;
-        _settings.Save();
+        if (!_initializing)
+        {
+            _settings.MergeWithExisting = value;
+            _settings.Save();
+        }
+
+        foreach (var file in Files)
+            file.ApplyPreferredMode(value, resetPin: !_initializing);
     }
 
     partial void OnUseTimestampChanged(bool value)
@@ -695,46 +699,114 @@ public partial class MainWindowViewModel : ObservableObject
     private bool CanBrowse() => !IsBusy;
 
     /// <summary>
-    /// Добавляет файлы в очередь. Файл подписи .sig прикладывается к своему
-    /// документу для объединения, если документ уже в списке (по имени: "документ.pdf.sig"
-    /// → "документ.pdf"); иначе пропускается.
+    /// Добавляет файлы в очередь. Документы ищут в своём каталоге подписи .sig/.p7s
+    /// по хешу содержимого (имя файла может не совпадать). Перетащенный .sig
+    /// прикладывается к документу из очереди по хешу, а если хеш не совпал —
+    /// по точному имени «документ.sig». Несопоставленные подписи перечисляются в статусе.
     /// </summary>
     public void AddFiles(params string[] filePaths)
     {
-        int added = 0, attached = 0, skippedSigs = 0;
+        var signatures = new List<string>();
+        var added = 0;
         foreach (var path in filePaths)
         {
             if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path))
                 continue;
 
-            if (path.EndsWith(".sig", StringComparison.OrdinalIgnoreCase))
+            if (SignatureDiscovery.IsSignatureFile(path))
             {
-                var documentPath = path[..^4];
-                var target = Files.FirstOrDefault(f =>
-                    string.Equals(f.FilePath, documentPath, StringComparison.OrdinalIgnoreCase));
-                if (target is not null)
-                    attached += target.AttachSignatures(new[] { path });
-                else
-                    skippedSigs++;
+                signatures.Add(path);
                 continue;
             }
 
-            if (Files.Any(f => string.Equals(f.FilePath, path, StringComparison.OrdinalIgnoreCase)))
+            if (Files.Any(file => SignatureDiscovery.SamePath(file.FilePath, path)))
                 continue;
 
-            Files.Add(new SignFileItem(path) { Owner = this });
+            var item = new SignFileItem(path) { Owner = this };
+            Files.Add(item);
+            item.RefreshDiscovery(MergeWithExisting);
             added++;
+        }
+
+        var attached = 0;
+        var unmatched = new List<string>();
+        foreach (var path in signatures)
+        {
+            var hits = 0;
+            foreach (var file in Files)
+            {
+                SignatureDiscovery.SignatureMatch? match;
+                try
+                {
+                    match = SignatureDiscovery.MatchToDocument(path, file.FilePath);
+                }
+                catch (Exception)
+                {
+                    match = null;
+                }
+
+                if (match is not { MatchingSigners: > 0 })
+                    continue;
+                file.AddExternalMatch(match, MergeWithExisting);
+                hits++;
+            }
+
+            if (hits > 0)
+            {
+                attached += hits;
+                continue;
+            }
+
+            var sibling = SignatureDiscovery.SiblingDocumentPath(path);
+            var named = sibling is null
+                ? null
+                : Files.FirstOrDefault(file => SignatureDiscovery.SamePath(file.FilePath, sibling));
+            if (named is not null)
+            {
+                attached += named.AttachSignatures(new[] { path });
+                continue;
+            }
+
+            unmatched.Add(System.IO.Path.GetFileName(path));
         }
 
         var parts = new List<string>();
         if (added > 0) parts.Add($"добавлено файлов: {added}");
         if (attached > 0) parts.Add($"приложено подписей: {attached}");
-        if (skippedSigs > 0) parts.Add($"пропущено .sig без документа в списке: {skippedSigs}");
+        if (unmatched.Count > 0)
+            parts.Add("не сопоставлены с документами в очереди: "
+                + string.Join(", ", unmatched.Select(name => "«" + name + "»")));
         if (parts.Count > 0)
         {
             var summary = string.Join(", ", parts);
             StatusText = char.ToUpper(summary[0]) + summary[1..] + $". Всего в очереди: {Files.Count}";
         }
+    }
+
+    /// <summary>Подписи, выбранные кнопкой «＋.sig»: приложить и, если хеш совпал, предложить их как файл соподписания.</summary>
+    public void AttachSignatureFiles(SignFileItem item, IReadOnlyList<string> paths)
+    {
+        var added = item.AttachSignatures(paths);
+        foreach (var path in paths)
+        {
+            SignatureDiscovery.SignatureMatch? match;
+            try
+            {
+                match = SignatureDiscovery.MatchToDocument(path, item.FilePath);
+            }
+            catch (Exception)
+            {
+                match = null;
+            }
+
+            if (match is { MatchingSigners: > 0 })
+                item.AddExternalMatch(match, MergeWithExisting);
+        }
+
+        if (added > 0)
+            StatusText = $"Приложено подписей к «{item.FileName}»: {added} (всего: {item.ExtraCount})";
+        else if (paths.Count > 0)
+            StatusText = $"К «{item.FileName}» не добавлено новых подписей.";
     }
 
     /// <summary>Открыть диалог выбора подписей других лиц для файла.</summary>
@@ -821,7 +893,8 @@ public partial class MainWindowViewModel : ObservableObject
     /// есть «имя.sig», плашки ставятся для ВСЕХ его подписантов; иначе —
     /// по данным выбранного сертификата.
     /// </summary>
-    public async Task StampWithoutSigningAsync(IReadOnlyList<string> pdfPaths, PdfStamper.StampOptions options)
+    public async Task StampWithoutSigningAsync(IReadOnlyList<string> pdfPaths, PdfStamper.StampOptions options,
+        string? signatureHint = null)
     {
         if (pdfPaths.Count == 0 || SelectedCertificate is not { } item)
             return;
@@ -843,7 +916,7 @@ public partial class MainWindowViewModel : ObservableObject
 
                     var stamped = await Task.Run(() =>
                     {
-                        var sigPath = path + ".sig";
+                        var sigPath = signatureHint ?? path + ".sig";
                         var certs = System.IO.File.Exists(sigPath)
                             ? CmsMerger.GetSignerCertificates(System.IO.File.ReadAllBytes(sigPath))
                             : Array.Empty<System.Security.Cryptography.X509Certificates.X509Certificate2>();
@@ -879,10 +952,10 @@ public partial class MainWindowViewModel : ObservableObject
     [RelayCommand]
     private async Task InspectSignaturesAsync(SignFileItem item)
     {
-        var sigPath = item.FilePath + ".sig";
+        var sigPath = item.SignaturePathForTools();
         if (!System.IO.File.Exists(sigPath))
         {
-            StatusText = $"Рядом с «{item.FileName}» нет файла подписи «{System.IO.Path.GetFileName(sigPath)}».";
+            StatusText = $"Для «{item.FileName}» не найден файл подписи (ни «{System.IO.Path.GetFileName(item.FilePath)}.sig», ни подпись по хешу документа).";
             return;
         }
 
@@ -899,17 +972,19 @@ public partial class MainWindowViewModel : ObservableObject
         if (result is null)
             return;
         SaveStampOptions(result);
-        await StampWithoutSigningAsync(new[] { item.FilePath }, result.Options);
+        var signature = item.SignaturePathForTools();
+        await StampWithoutSigningAsync(new[] { item.FilePath }, result.Options,
+            System.IO.File.Exists(signature) ? signature : null);
     }
 
     /// <summary>ПКМ: извлечь из контейнера «имя.sig» рядом с файлом.</summary>
     [RelayCommand(CanExecute = nameof(CanBrowse))]
     private async Task ExtractItemAsync(SignFileItem item)
     {
-        var sigPath = item.FilePath + ".sig";
+        var sigPath = item.SignaturePathForTools();
         if (!System.IO.File.Exists(sigPath))
         {
-            StatusText = $"Рядом с «{item.FileName}» нет файла подписи для извлечения.";
+            StatusText = $"Для «{item.FileName}» нет файла подписи для извлечения.";
             return;
         }
 
@@ -918,17 +993,24 @@ public partial class MainWindowViewModel : ObservableObject
 
     /// <summary>ПКМ: собрать криптоконтейнер из файла и его подписи рядом.</summary>
     [RelayCommand(CanExecute = nameof(CanBrowse))]
-    private Task BuildContainerItemAsync(SignFileItem item) =>
-        BuildContainerAsync(item.FilePath, null);
+    private Task BuildContainerItemAsync(SignFileItem item)
+    {
+        var signatures = item.DiscoveredMatches.Select(match => match.Path).ToList();
+        var canonical = item.FilePath + ".sig";
+        if (System.IO.File.Exists(canonical)
+            && signatures.All(path => !SignatureDiscovery.SamePath(path, canonical)))
+            signatures.Insert(0, canonical);
+        return BuildContainerAsync(item.FilePath, signatures.Count > 0 ? signatures : null);
+    }
 
     /// <summary>ПКМ: разделить групповую подпись «имя.sig» рядом с файлом по подписантам.</summary>
     [RelayCommand(CanExecute = nameof(CanBrowse))]
     private async Task SplitItemAsync(SignFileItem item)
     {
-        var sigPath = item.FilePath + ".sig";
+        var sigPath = item.SignaturePathForTools();
         if (!System.IO.File.Exists(sigPath))
         {
-            StatusText = $"Рядом с «{item.FileName}» нет файла подписи для разделения.";
+            StatusText = $"Для «{item.FileName}» нет файла подписи для разделения.";
             return;
         }
 
@@ -939,10 +1021,10 @@ public partial class MainWindowViewModel : ObservableObject
     [RelayCommand(CanExecute = nameof(CanBrowse))]
     private async Task RemoveSignerItemAsync(SignFileItem item)
     {
-        var sigPath = item.FilePath + ".sig";
+        var sigPath = item.SignaturePathForTools();
         if (!System.IO.File.Exists(sigPath))
         {
-            StatusText = $"Рядом с «{item.FileName}» нет файла подписи.";
+            StatusText = $"Для «{item.FileName}» нет файла подписи.";
             return;
         }
 
@@ -1140,6 +1222,66 @@ public partial class MainWindowViewModel : ObservableObject
     private bool CanSignAll() =>
         !IsBusy && SelectedCertificate is not null && Files.Count > 0;
 
+    /// <summary>
+    /// Текст подтверждения перед подписанием: новый файл при уже найденных подписях,
+    /// перезапись «документ.sig» без объединения, исключение подписантов.
+    /// null — подтверждение не требуется.
+    /// </summary>
+    internal string? DescribeSignRisks(IReadOnlyList<SignFileItem> files)
+    {
+        var blocks = new List<string>();
+        foreach (var file in files)
+        {
+            var createNew = file.SelectedCoSignOption is not { CreateNew: false };
+            if (createNew)
+            {
+                var canonical = file.FilePath + ".sig";
+                var others = file.DiscoveredMatches
+                    .Where(match => !SignatureDiscovery.SamePath(match.Path, canonical))
+                    .ToList();
+                if (others.Count > 0)
+                {
+                    blocks.Add($"«{file.FileName}»: в папке уже есть подходящая подпись "
+                        + string.Join(", ", others.Select(match =>
+                            $"«{System.IO.Path.GetFileName(match.Path)}» ({match.SignerCount} {SignatureDiscovery.SignerWord(match.SignerCount)})"))
+                        + ". Будет создан новый файл «" + System.IO.Path.GetFileName(canonical)
+                        + "», эти подписи не изменятся и не будут объединены.");
+                }
+
+                if (System.IO.File.Exists(canonical))
+                {
+                    blocks.Add($"«{file.FileName}»: файл «{System.IO.Path.GetFileName(canonical)}» уже существует "
+                        + "и будет перезаписан без объединения. Подписанты из него не сохранятся в новом файле "
+                        + "(перед заменой создаётся резервная копия).");
+                }
+            }
+
+            var inputs = file.PlannedMergeInputs();
+            if (inputs.Count == 0)
+                continue;
+            try
+            {
+                var document = System.IO.File.ReadAllBytes(file.FilePath);
+                var signatures = inputs.Select(System.IO.File.ReadAllBytes).ToList();
+                var preview = CmsMerger.MergeForDocument(signatures, document, attach: false, throwIfEmpty: false);
+                if (preview.ExcludedSigners.Count > 0)
+                {
+                    blocks.Add($"«{file.FileName}»: при объединении будут исключены подписанты, "
+                        + "чья подпись не соответствует документу: " + string.Join("; ", preview.ExcludedSigners)
+                        + ". Они не попадут в файл подписи.");
+                }
+            }
+            catch (Exception e)
+            {
+                blocks.Add($"«{file.FileName}»: не удалось заранее проверить объединяемые подписи ({e.Message}).");
+            }
+        }
+
+        if (blocks.Count == 0)
+            return null;
+        return string.Join("\n\n", blocks) + "\n\nПродолжить?";
+    }
+
     [RelayCommand(CanExecute = nameof(CanSignAll))]
     private async Task SignAllAsync()
     {
@@ -1208,8 +1350,28 @@ public partial class MainWindowViewModel : ObservableObject
                 if (poaPackage.Check.State == PowerOfAttorneyService.CheckState.Warning)
                     Log("⚠ МЧД: " + poaPackage.Check.Message);
             }
-            foreach (var file in Files.Where(f => f.Status != SignStatus.Signed).ToList())
+
+            var pending = Files.Where(file => file.Status != SignStatus.Signed).ToList();
+            var risks = await Task.Run(() => DescribeSignRisks(pending));
+            if (risks is not null)
             {
+                if (RequestConfirmAsync is null)
+                {
+                    StatusText = "Подписание остановлено — нужно подтверждение. " + risks;
+                    return;
+                }
+
+                var confirmed = await RequestConfirmAsync("Подтверждение подписания", risks);
+                if (!confirmed)
+                {
+                    StatusText = "Подписание отменено.";
+                    return;
+                }
+            }
+
+            foreach (var file in pending)
+            {
+                file.Warning = null;
                 file.Status = SignStatus.Signing;
                 StatusText = $"Подписание: {file.FileName}";
 
@@ -1217,11 +1379,18 @@ public partial class MainWindowViewModel : ObservableObject
                 {
                     // Task.Run: подпись может блокировать (диалог PIN-кода CSP),
                     // не держим UI-поток.
+                    var inputs = file.PlannedMergeInputs();
+                    var existing = file.SelectedCoSignOption is { CreateNew: false, SignaturePath: { } selected }
+                        ? selected
+                        : null;
+                    var extras = inputs.Where(path => existing is null
+                        || !SignatureDiscovery.SamePath(path, existing)).ToList();
                     var options = new DocumentSigner.SignOptions
                     {
                         Detached = IsDetached,
-                        MergeWithExisting = MergeWithExisting,
-                        ExtraSignatures = file.ExtraSignatures.ToList(),
+                        MergeWithExisting = existing is not null,
+                        ExistingSignaturePath = existing,
+                        ExtraSignatures = extras,
                         Timestamp = UseTimestamp,
                         TsaUrl = TsaUrl,
                         Stamp = UseStamp,
@@ -1236,23 +1405,25 @@ public partial class MainWindowViewModel : ObservableObject
                         () => _documentSigner.SignFileAsync(file.FilePath, certificate, options));
                     file.SignaturePath = result.SignaturePath;
                     file.SignerCount = result.SignerCount;
+                    file.PreviousSignerCount = result.PreviousSignerCount;
+                    file.AppendedToExisting = result.AppendedToExisting;
 
-                    var notes = new List<string>();
                     if (result.ExcludedSigners.Count > 0)
-                        notes.Add("исключены не соответствующие документу подписи: "
-                                  + string.Join("; ", result.ExcludedSigners));
-                    if (result.UnverifiedSigners.Count > 0)
-                        notes.Add("не удалось проверить: " + string.Join("; ", result.UnverifiedSigners));
-                    file.Message = notes.Count > 0 ? string.Join(". ", notes) : null;
+                        file.Warning = "Внимание: исключены подписанты, подпись которых не соответствует документу: "
+                            + string.Join("; ", result.ExcludedSigners);
+                    file.Message = result.UnverifiedSigners.Count > 0
+                        ? "не удалось проверить: " + string.Join("; ", result.UnverifiedSigners)
+                        : null;
 
                     file.Status = SignStatus.Signed;
                     signed++;
-                    Log($"  [OK] {file.FileName} → {System.IO.Path.GetFileName(result.SignaturePath)}"
-                        + (result.SignerCount > 1 ? $" (подписантов: {result.SignerCount})" : "")
+                    Log($"  [OK] {file.FileName} → {file.StatusDisplay}"
+                        + (result.BackupPath is null
+                            ? ""
+                            : $". Резервная копия: {System.IO.Path.GetFileName(result.BackupPath)}")
                         + (result.StampedCopyPath is null
                             ? ""
-                            : $"; копия со штампом (без подписи): {System.IO.Path.GetFileName(result.StampedCopyPath)}")
-                        + (file.Message is null ? "" : $". {file.Message}"));
+                            : $"; копия со штампом (без подписи): {System.IO.Path.GetFileName(result.StampedCopyPath)}"));
                 }
                 catch (Exception ex)
                 {
