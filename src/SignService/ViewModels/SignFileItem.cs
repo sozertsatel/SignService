@@ -49,6 +49,9 @@ public partial class SignFileItem : ObservableObject
     private readonly List<SignatureDiscovery.SignatureMatch> _external = new();
     private List<SignatureDiscovery.SignatureMatch> _discovered = new();
     private bool _adjustingSelection;
+    private bool _mentionBackup;
+    private bool _followingShared;
+    private bool _sharedWantsAdd;
     private int _unionCount;
     private string _planText = "будет создан новый файл подписи";
 
@@ -127,6 +130,19 @@ public partial class SignFileItem : ObservableObject
     [ObservableProperty]
     private CoSignOption? _selectedCoSignOption;
 
+    /// <summary>Режим задаёт первый файл («Применить ко всем») — список в этой строке только для чтения.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CoSignChoiceEnabled))]
+    private bool _coSignLocked;
+
+    public bool CoSignChoiceEnabled => !CoSignLocked;
+
+    /// <summary>Общий режим «добавить» невозможен: у файла нет подходящей подписи.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(WarningDisplay))]
+    [NotifyPropertyChangedFor(nameof(HasWarning))]
+    private bool _sharedAddUnavailable;
+
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(HasExtra))]
     [NotifyPropertyChangedFor(nameof(ExtraDisplay))]
@@ -173,6 +189,39 @@ public partial class SignFileItem : ObservableObject
             return;
         _external.Add(match);
         RefreshDiscovery(preferAdd);
+    }
+
+    /// <summary>Показывать ли в плане, что перед заменой сохранится .bak.</summary>
+    public void SetBackupMention(bool enabled)
+    {
+        if (_mentionBackup == enabled)
+            return;
+        _mentionBackup = enabled;
+        UpdatePlan();
+    }
+
+    /// <summary>
+    /// Повторяет режим первого файла. Если добавить не к чему, остаётся «Создать новую»
+    /// и строка явно об этом говорит.
+    /// </summary>
+    public void FollowSharedMode(bool addToExisting)
+    {
+        _followingShared = true;
+        _sharedWantsAdd = addToExisting;
+        _adjustingSelection = true;
+        ApplySharedSelection();
+        _adjustingSelection = false;
+        UpdatePlan();
+    }
+
+    /// <summary>Снимает общий режим, не меняя уже выбранный пункт списка.</summary>
+    public void StopFollowingSharedMode()
+    {
+        _followingShared = false;
+        if (!SharedAddUnavailable)
+            return;
+        SharedAddUnavailable = false;
+        UpdatePlan();
     }
 
     /// <summary>Общий переключатель «добавить / создать новую» для файлов без ручного выбора.</summary>
@@ -290,6 +339,8 @@ public partial class SignFileItem : ObservableObject
         if (!_adjustingSelection && value is not null)
             CoSignPinned = true;
         UpdatePlan();
+        if (!_adjustingSelection && value is not null)
+            Owner?.NotifyCoSignSelectionChanged(this);
     }
 
     private void ApplyMatches(List<SignatureDiscovery.SignatureMatch> matches, bool preferAdd)
@@ -310,7 +361,9 @@ public partial class SignFileItem : ObservableObject
         CoSignOptions.Add(new CoSignOption(null, 0));
 
         _adjustingSelection = true;
-        if (pinned && previous is null)
+        if (_followingShared)
+            ApplySharedSelection();
+        else if (pinned && previous is null)
             SelectedCoSignOption = CoSignOptions.LastOrDefault(option => option.CreateNew);
         else if (pinned && previous is not null)
             SelectedCoSignOption = CoSignOptions.FirstOrDefault(option =>
@@ -323,6 +376,27 @@ public partial class SignFileItem : ObservableObject
             SelectedCoSignOption = CoSignOptions.LastOrDefault(option => option.CreateNew) ?? CoSignOptions.LastOrDefault();
         _adjustingSelection = false;
         UpdatePlan();
+    }
+
+    private void ApplySharedSelection()
+    {
+        if (!_sharedWantsAdd)
+        {
+            SelectedCoSignOption = CoSignOptions.LastOrDefault(option => option.CreateNew) ?? CoSignOptions.LastOrDefault();
+            SharedAddUnavailable = false;
+            return;
+        }
+
+        var add = CoSignOptions.FirstOrDefault(option => !option.CreateNew);
+        if (add is null)
+        {
+            SelectedCoSignOption = CoSignOptions.LastOrDefault(option => option.CreateNew) ?? CoSignOptions.LastOrDefault();
+            SharedAddUnavailable = true;
+            return;
+        }
+
+        SelectedCoSignOption = add;
+        SharedAddUnavailable = false;
     }
 
     private void UpdatePlan()
@@ -348,15 +422,32 @@ public partial class SignFileItem : ObservableObject
 
         var canonical = FilePath + ".sig";
         if (File.Exists(canonical))
-            return "будет создан новый файл подписи — существующий «" + Path.GetFileName(canonical)
-                + "» будет заменён (сохранится резервная копия)";
+        {
+            var sentence = "будет создан новый файл подписи — существующий «" + Path.GetFileName(canonical)
+                + "» будет заменён";
+            if (_mentionBackup)
+                sentence += " (сохранится резервная копия)";
+            return sentence;
+        }
+
         return "будет создан новый файл подписи";
     }
+
+    private const string SharedFallbackText =
+        "Нет подходящей подписи — будет создан новый файл. Режим «Добавить к существующей», как у первого файла, здесь недоступен.";
 
     private string? DiscoveryWarning()
     {
         if (Status != SignStatus.Pending)
             return null;
+        var discovery = MismatchedSignerWarning();
+        if (!SharedAddUnavailable)
+            return discovery;
+        return discovery is null ? SharedFallbackText : SharedFallbackText + " " + discovery;
+    }
+
+    private string? MismatchedSignerWarning()
+    {
         var names = new List<string>();
         foreach (var path in PlannedMergeInputs())
         {

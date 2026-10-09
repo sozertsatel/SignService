@@ -51,6 +51,20 @@ internal static class UiSmokeTests
         Dispatcher.UIThread.RunJobs();
         Assert(window.CaptureRenderedFrame() is not null, "main window must render");
 
+        var browse = window.GetVisualDescendants().OfType<Button>().First(b => b.Content?.ToString() == "Обзор…");
+        var toolsButton = window.GetVisualDescendants().OfType<Button>().First(b => b.Content?.ToString()?.StartsWith("Инструменты", StringComparison.Ordinal) == true);
+        var clear = window.GetVisualDescendants().OfType<Button>().First(b => b.Content?.ToString() == "Очистить список");
+        var drop = window.GetVisualDescendants().OfType<Border>().First(b => b.Name == "DropZone");
+        var browseAt = browse.TranslatePoint(new Point(0, 0), window)!.Value;
+        var toolsAt = toolsButton.TranslatePoint(new Point(0, 0), window)!.Value;
+        var clearAt = clear.TranslatePoint(new Point(0, 0), window)!.Value;
+        var dropAt = drop.TranslatePoint(new Point(0, 0), window)!.Value;
+        Assert(browseAt.Y < dropAt.Y && toolsAt.Y < dropAt.Y && clearAt.Y < dropAt.Y,
+            $"browse, tools and clear must sit above the file list (browse {browseAt.Y}, drop {dropAt.Y})");
+        Assert(Math.Abs(browseAt.Y - toolsAt.Y) < 4 && Math.Abs(browseAt.Y - clearAt.Y) < 4,
+            "browse, tools and clear must share one row");
+        Assert(toolsAt.X > browseAt.X && clearAt.X > toolsAt.X, "clear must stay on the right of tools");
+
         // Контекстное меню — отдельное всплывающее окно вне дерева элементов списка.
         var row = window.GetVisualDescendants().OfType<Border>().First(b => b.ContextMenu is not null);
         var rowButtons = row.GetVisualDescendants().OfType<Button>().ToList();
@@ -73,8 +87,18 @@ internal static class UiSmokeTests
         flyout.ShowAt(tools);
         Dispatcher.UIThread.RunJobs();
         var toolItems = flyout.Items.OfType<MenuItem>().ToList();
-        Assert(toolItems.Count >= 7 && toolItems.All(i => i.Command is not null), "tools menu commands must be bound");
+        Assert(toolItems.Count == 6 && toolItems.All(i => i.Command is not null)
+            && toolItems.All(i => i.Header?.ToString()?.StartsWith("Объединить", StringComparison.Ordinal) != true),
+            "tools menu must stay bound and no longer offer merge: " + string.Join("; ", toolItems.Select(i => i.Header)));
         flyout.Hide();
+
+        var labels = window.GetVisualDescendants().OfType<TextBlock>().Select(block => block.Text).ToList();
+        Assert(labels.Any(text => text != null && text.StartsWith("Версия ", StringComparison.Ordinal)),
+            "main window must show the version");
+        Assert(labels.All(text => text == null || !text.Contains("Зайнуллин", StringComparison.Ordinal)),
+            "author credit must not stay on the main window");
+        var checks = window.GetVisualDescendants().OfType<CheckBox>().Select(box => box.Content?.ToString()).ToList();
+        Assert(checks.Any(text => text == "Применить ко всем"), "apply-to-all checkbox must sit on the main window");
 
         var signers = new[]
         {
@@ -96,6 +120,13 @@ internal static class UiSmokeTests
             dialog.Show();
             Dispatcher.UIThread.RunJobs();
             Assert(dialog.CaptureRenderedFrame() is not null, dialog.GetType().Name + " must render");
+            if (dialog is SettingsDialog)
+            {
+                var backup = dialog.GetVisualDescendants().OfType<CheckBox>()
+                    .Select(box => box.Content?.ToString())
+                    .Any(text => text != null && text.Contains("резервную копию", StringComparison.Ordinal));
+                Assert(backup, "settings must offer the .bak checkbox");
+            }
             dialog.Close();
         }
 
@@ -124,6 +155,7 @@ internal static class UiSmokeTests
         window.Show();
         Dispatcher.UIThread.RunJobs();
         SaveFrame(window, "queue-add-existing");
+        SaveFrame(window, "main-window", "/opt/cursor/artifacts");
 
         vm.MergeWithExisting = false;
         Dispatcher.UIThread.RunJobs();
@@ -161,10 +193,10 @@ internal static class UiSmokeTests
         window.Close();
     }
 
-    private static void SaveFrame(Window window, string name)
+    private static void SaveFrame(Window window, string name, string? directory = null)
     {
         var frame = window.CaptureRenderedFrame() ?? throw new Exception("no frame: " + name);
-        var output = Path.Combine("/opt/cursor/artifacts/screenshots", name + ".png");
+        var output = Path.Combine(directory ?? "/opt/cursor/artifacts/screenshots", name + ".png");
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
         frame.Save(output);
         frame.Dispose();

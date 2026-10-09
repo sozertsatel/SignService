@@ -35,6 +35,8 @@ internal static class CoSignTests
         var other = System.Text.Encoding.UTF8.GetBytes("другая версия документа");
 
         await CheckDiscoveryAndAppend(root, signer, certA, certB, data);
+        await CheckBackupOffByDefault(root, signer, certA, certB, data);
+        await CheckApplyModeToAll(root, signer, certA, data);
         await CheckCreateNewConfirmation(root, signer, certA, certB, data);
         await CheckExclusionConfirmation(root, signer, certA, certB, certC, data, other);
         await CheckUnmatchedSignatureListed(root, signer, certA, data, other);
@@ -66,6 +68,7 @@ internal static class CoSignTests
         Assert(SignatureDiscovery.SamePath(item.PlannedOutputPath, odd), "output is the discovered file, not a new имя.sig");
 
         vm.SelectedCertificate = new CertificateItem(certB);
+        vm.CreateSignatureBackup = true;
         await vm.SignAllCommand.ExecuteAsync(null);
         Assert(item.Status == SignStatus.Signed, "append sign failed: " + item.Message);
         Assert(item.StatusDisplay.StartsWith("Подписан: 2 (1 + ваша) → договор-.pdf .sig", StringComparison.Ordinal),
@@ -77,6 +80,86 @@ internal static class CoSignTests
             "backup must keep the signature bytes from before the append");
         Assert(signer.VerifyDetached(data, await File.ReadAllBytesAsync(odd)), "appended signature must verify");
         Console.WriteLine("cosign: odd name discovered by hash, append shows «2 (1 + ваша)», backup kept: OK");
+    }
+
+    private static async Task CheckBackupOffByDefault(string root, DocumentSigner signer,
+        X509Certificate2 certA, X509Certificate2 certB, byte[] data)
+    {
+        Assert(!new AppSettings().CreateSignatureBackup, "backup setting must default to off");
+        var dir = Path.Combine(root, "no_backup");
+        Directory.CreateDirectory(dir);
+        var document = Path.Combine(dir, "акт.pdf");
+        var odd = Path.Combine(dir, "акт-.pdf .sig");
+        await File.WriteAllBytesAsync(document, data);
+        await File.WriteAllBytesAsync(odd, signer.Sign(data, certA));
+
+        var vm = ViewModel(dir);
+        vm.AddFiles(document);
+        vm.SelectedCertificate = new CertificateItem(certB);
+        await vm.SignAllCommand.ExecuteAsync(null);
+        Assert(vm.Files.Single().Status == SignStatus.Signed, "sign without backup failed: " + vm.Files.Single().Message);
+        Assert(Directory.GetFiles(dir, "*.bak").Length == 0, "default settings must not create a .bak");
+        Assert(CmsMerger.CountSigners(await File.ReadAllBytesAsync(odd)) == 2, "append without backup must still add the signer");
+        Console.WriteLine("cosign: backup checkbox defaults off and skips .bak: OK");
+    }
+
+    private static async Task CheckApplyModeToAll(string root, DocumentSigner signer, X509Certificate2 certA, byte[] data)
+    {
+        Assert(!new AppSettings().ApplyCoSignToAll, "apply-to-all must default to off");
+        var dir = Path.Combine(root, "apply_all");
+        Directory.CreateDirectory(dir);
+        var first = Path.Combine(dir, "первый.pdf");
+        var second = Path.Combine(dir, "второй.pdf");
+        var third = Path.Combine(dir, "третий.pdf");
+        var thirdBytes = System.Text.Encoding.UTF8.GetBytes("другой документ для третьего файла");
+        await File.WriteAllBytesAsync(first, data);
+        await File.WriteAllBytesAsync(second, System.Text.Encoding.UTF8.GetBytes("документ без своей подписи"));
+        await File.WriteAllBytesAsync(third, thirdBytes);
+        await File.WriteAllBytesAsync(Path.Combine(dir, "первый-.pdf .sig"), signer.Sign(data, certA));
+        await File.WriteAllBytesAsync(Path.Combine(dir, "третий-.pdf .sig"), signer.Sign(thirdBytes, certA));
+
+        var vm = ViewModel(dir);
+        vm.AddFiles(first, second);
+        var lead = vm.Files[0];
+        var other = vm.Files[1];
+        Assert(lead.SelectedCoSignOption is { CreateNew: false }, "first file has a signature to append to");
+        Assert(other.SelectedCoSignOption is { CreateNew: true } && !other.SharedAddUnavailable,
+            "without the checkbox a file with no signature just offers a new file");
+
+        vm.ApplyCoSignToAll = true;
+        Assert(!other.CoSignChoiceEnabled && other.SharedAddUnavailable
+            && other.SelectedCoSignOption is { CreateNew: true }
+            && other.WarningDisplay!.Contains("недоступен"),
+            "apply-to-all must say when add mode is impossible: " + other.WarningDisplay);
+        Assert(lead.CoSignChoiceEnabled, "the first file stays editable");
+
+        lead.SelectedCoSignOption = lead.CoSignOptions.Single(option => option.CreateNew);
+        Assert(other.SelectedCoSignOption is { CreateNew: true } && !other.SharedAddUnavailable,
+            "switching the first file to create-new clears the fallback note");
+
+        lead.SelectedCoSignOption = lead.CoSignOptions.First(option => !option.CreateNew);
+        Assert(other.SharedAddUnavailable, "switching the first file back to add restores the note");
+
+        vm.AddFiles(third);
+        var added = vm.Files[2];
+        Assert(!added.CoSignChoiceEnabled && added.SelectedCoSignOption is { CreateNew: false },
+            "a newly added file with its own signature follows the first file's add mode");
+
+        vm.ApplyCoSignToAll = false;
+        Assert(added.CoSignChoiceEnabled && lead.SelectedCoSignOption is { CreateNew: false },
+            "turning the checkbox off unlocks rows and keeps the current mode");
+        added.SelectedCoSignOption = added.CoSignOptions.Single(option => option.CreateNew);
+        Assert(lead.SelectedCoSignOption is { CreateNew: false } && added.SelectedCoSignOption is { CreateNew: true },
+            "without the checkbox files choose independently");
+
+        var saved = System.Text.Json.JsonSerializer.Deserialize<AppSettings>(
+            await File.ReadAllTextAsync(Path.Combine(dir, "settings", "settings.json")));
+        Assert(saved is { ApplyCoSignToAll: false }, "checkbox state must be saved");
+        vm.ApplyCoSignToAll = true;
+        saved = System.Text.Json.JsonSerializer.Deserialize<AppSettings>(
+            await File.ReadAllTextAsync(Path.Combine(dir, "settings", "settings.json")));
+        Assert(saved is { ApplyCoSignToAll: true }, "turning the checkbox on must be saved");
+        Console.WriteLine("cosign: apply-to-all follows the first file and names a fallback: OK");
     }
 
     private static async Task CheckCreateNewConfirmation(string root, DocumentSigner signer,
@@ -98,8 +181,12 @@ internal static class CoSignTests
         vm.MergeWithExisting = false;
         var item = vm.Files.Single();
         Assert(item.StatusDisplay.Contains("будет создан новый файл подписи")
-            && item.StatusDisplay.Contains("будет заменён"),
-            "create-new row must warn that the canonical file will be replaced: " + item.StatusDisplay);
+            && item.StatusDisplay.Contains("будет заменён")
+            && !item.StatusDisplay.Contains("резервн"),
+            "create-new row must warn about replacement and not promise a backup while the setting is off: " + item.StatusDisplay);
+        vm.CreateSignatureBackup = true;
+        Assert(item.StatusDisplay.Contains("резервная копия"),
+            "enabled backup must be mentioned in the plan: " + item.StatusDisplay);
         var risks = vm.DescribeSignRisks(vm.Files.ToList());
         Assert(risks is not null && risks.Contains("заявка-.pdf .sig") && risks.Contains("перезаписан без объединения"),
             "confirmation must mention the matching signature and the overwrite: " + risks);

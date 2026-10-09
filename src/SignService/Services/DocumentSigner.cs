@@ -28,6 +28,9 @@ public class DocumentSigner
         /// <summary>Объединять ли с уже существующим файлом .sig (соподписание).</summary>
         public bool MergeWithExisting { get; init; }
 
+        /// <summary>Сохранять .bak рядом перед перезаписью существующего файла подписи.</summary>
+        public bool CreateBackup { get; init; }
+
         /// <summary>Пути к .sig других подписантов для объединения.</summary>
         public IReadOnlyList<string> ExtraSignatures { get; init; } = Array.Empty<string>();
 
@@ -253,9 +256,9 @@ public class DocumentSigner
         if (!(await File.ReadAllBytesAsync(targetPath, cancellationToken)).AsSpan().SequenceEqual(data))
             throw new IOException("Документ изменился во время подписания. Подпись не сохранена; повторите операцию.");
         if (poaPackage is not null) PowerOfAttorneyService.CopyPackage(poaPackage, targetPath);
-        // Существующий .sig не затирается молча: рядом остаётся копия с отметкой времени.
+        // Резервная копия — только если её включили в настройках.
         string? backupPath = null;
-        if (File.Exists(signaturePath))
+        if (options.CreateBackup && File.Exists(signaturePath))
             backupPath = SignatureBackup.Create(signaturePath);
         await AtomicFile.WriteAsync(signaturePath, output, overwrite: true, cancellationToken);
 
