@@ -96,6 +96,7 @@ internal static class ReviewRegressionTests
         CheckVerifierRobustness(signer, certA, certB, current);
         await CheckVerificationSettingsAsync(root, signer);
         await CheckCachesAsync(root, signer, certA, certB, current);
+        await CheckForkReviewScenariosAsync(root, signer);
 
         if (OperatingSystem.IsWindows())
             await CheckUpdaterAsync(root);
@@ -297,6 +298,96 @@ internal static class ReviewRegressionTests
             && SignatureVerifier.Verify(attachedOut.Signature, null, Crypto).CryptographicallyValid, "merge to attached");
         Assert(CmsMerger.ExtractContent(automatic.Signature)!.SequenceEqual(document), "merge keeps attached form by default");
         Console.WriteLine("regression: one document hash per algorithm; merge output mode attached/detached/auto: OK");
+    }
+
+    // Сценарии из ревью форка debug23win (PR #2): там объединение сверяло только messageDigest,
+    // МЧД проверялась без доверия и отзыва, а сертификат мог пропасть вместе с исключённым входом.
+    private static async Task CheckForkReviewScenariosAsync(string root, DocumentSigner signer)
+    {
+        var dir = Path.Combine(root, "fork_review");
+        Directory.CreateDirectory(dir);
+        using var good = MakeCertificate("CN=Добросовестный");
+        using var damagedSigner = MakeCertificate("CN=Повреждённая подпись");
+        using var own = MakeCertificate("CN=Своя подпись");
+        var data = Encoding.UTF8.GetBytes("документ для соподписания");
+        var document = Path.Combine(dir, "договор.pdf");
+        await File.WriteAllBytesAsync(document, data);
+
+        // 1. Изменённое значение подписи при верном messageDigest исключается во всех путях объединения.
+        var damaged = signer.Sign(data, damagedSigner);
+        var value = CmsMerger.GetSignatureValue(damaged);
+        damaged[damaged.AsSpan().IndexOf(value) + value.Length / 2] ^= 1;
+        var damagedPath = Path.Combine(dir, "договор.pdf (повреждённая).sig");
+        var goodPath = Path.Combine(dir, "договор.pdf (контрагент).sig");
+        await File.WriteAllBytesAsync(damagedPath, damaged);
+        await File.WriteAllBytesAsync(goodPath, signer.Sign(data, good));
+
+        var mergedFiles = CmsExtractor.MergeSignatureFiles(new[] { damagedPath, goodPath });
+        Assert(mergedFiles.ExcludedSigners.SequenceEqual(new[] { "Повреждённая подпись" }) && mergedFiles.SignerCount == 1
+            && SignatureVerifier.Verify(await File.ReadAllBytesAsync(mergedFiles.OutputPath), data, Crypto).CryptographicallyValid,
+            "«Объединить .sig»: damaged signature value must be excluded, result must verify");
+        var container = CmsExtractor.BuildContainer(document, new[] { damagedPath, goodPath });
+        Assert(container.ExcludedSigners.Count == 1 && container.SignerCount == 1
+            && SignatureVerifier.Verify(await File.ReadAllBytesAsync(container.OutputPath), null, Crypto).CryptographicallyValid,
+            "«Собрать контейнер»: damaged signature value must be excluded");
+        var cosigned = await signer.SignFileAsync(document, own, new DocumentSigner.SignOptions
+        {
+            MergeWithExisting = false, ExtraSignatures = new[] { damagedPath, goodPath },
+        });
+        Assert(cosigned.ExcludedSigners.Count == 1 && cosigned.SignerCount == 2
+            && SignatureVerifier.Verify(await File.ReadAllBytesAsync(cosigned.SignaturePath), data, Crypto).CryptographicallyValid,
+            "co-signing: damaged signature value must be excluded, result must verify");
+        Console.WriteLine("fork review: damaged signature value with intact messageDigest excluded from merge, container and co-signing: OK");
+
+        // 2. Сертификат оставшегося подписанта был только в контейнере исключённого — он сохраняется.
+        var key = Org.BouncyCastle.Security.DotNetUtilities.GetRsaKeyPair(good.GetRSAPrivateKey()!);
+        var goodBc = new Org.BouncyCastle.X509.X509CertificateParser().ReadCertificate(good.RawData);
+        var noCertificates = new Org.BouncyCastle.Cms.CmsSignedDataGenerator();
+        noCertificates.AddSignerInfoGenerator(new Org.BouncyCastle.Cms.SignerInfoGeneratorBuilder()
+            .Build(new Org.BouncyCastle.Crypto.Operators.Asn1SignatureFactory("SHA256WITHRSA", key.Private), goodBc));
+        var withoutCertificate = noCertificates.Generate(new Org.BouncyCastle.Cms.CmsProcessableByteArray(data), false).GetEncoded();
+        Assert(SignatureVerifier.Verify(withoutCertificate, data, Crypto).Signers.Single().Signature.State == VerificationState.Unknown,
+            "precondition: the signature alone has no certificate");
+        var staleCarrier = new Org.BouncyCastle.Cms.CmsSignedData(signer.Sign(Encoding.UTF8.GetBytes("старая версия"), damagedSigner));
+        var carrier = Org.BouncyCastle.Cms.CmsSignedData.ReplaceCertificatesAndCrls(staleCarrier,
+            Org.BouncyCastle.Utilities.Collections.CollectionUtilities.CreateStore(
+                staleCarrier.GetCertificates().EnumerateMatches(null).Append(goodBc).ToList()),
+            null, null).GetEncoded();
+        var retained = CmsMerger.MergeForDocument(new[] { carrier, withoutCertificate }, data);
+        var retainedCheck = SignatureVerifier.Verify(retained.Signature, data, Crypto);
+        Assert(retained.SignerCount == 1 && retained.ExcludedSigners.Count == 1
+            && retainedCheck.Signers.Single().CryptographicallyValid
+            && retainedCheck.Signers.Single().Name.Contains("Добросовестный"),
+            "certificate of the kept signer must survive the exclusion of its carrier container");
+        Console.WriteLine("fork review: certificate from an excluded signer's container is kept for the remaining signer: OK");
+
+        // 3. МЧД: нет номера и даты выдачи; просроченный и недоверенный самоподписанный сертификат руководителя.
+        var xmlPath = Path.Combine(dir, "mchd.xml");
+        using var representative = MakeCertificate("CN=Представитель, OID.1.2.643.3.131.1.1=123456789012, OID.1.2.643.100.3=12345678901");
+        using var headKey = RSA.Create(2048);
+        async Task<PowerOfAttorneyService.CheckResult> Poa(string svDov, X509Certificate2 head)
+        {
+            await File.WriteAllTextAsync(xmlPath, $"<Доверенность><СвДов {svDov}/><СвРосОрг ИННЮЛ=\"1234567890\"/>"
+                + "<СвУпПред><СведФизЛ ИННФЛ=\"123456789012\" СНИЛС=\"12345678901\"><ФИО Фамилия=\"Представитель\"/></СведФизЛ></СвУпПред></Доверенность>");
+            await File.WriteAllBytesAsync(xmlPath + ".sig", signer.Sign(await File.ReadAllBytesAsync(xmlPath), head));
+            return PowerOfAttorneyService.Validate(PowerOfAttorneyService.Parse(xmlPath, xmlPath + ".sig"), representative);
+        }
+
+        var validTo = $"СрокДейст=\"{DateTime.Today.AddYears(1):yyyy-MM-dd}\"";
+        var issued = $"ДатаВыдДовер=\"{DateTime.Today.AddDays(-1):yyyy-MM-dd}\"";
+        using var validHead = new CertificateRequest("CN=Руководитель", headKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
+            .CreateSelfSigned(DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddYears(1));
+        using var expiredHead = new CertificateRequest("CN=Руководитель", headKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
+            .CreateSelfSigned(DateTimeOffset.Now.AddDays(-30), DateTimeOffset.Now.AddDays(-5));
+        Assert((await Poa(validTo, validHead)).State == PowerOfAttorneyService.CheckState.Error, "POA without number and issue date must be rejected");
+        Assert((await Poa($"НомДовер=\"1\" {validTo}", validHead)).State == PowerOfAttorneyService.CheckState.Error, "POA without issue date must be rejected");
+        Assert((await Poa($"{issued} {validTo}", validHead)).State == PowerOfAttorneyService.CheckState.Error, "POA without number must be rejected");
+        Assert((await Poa($"НомДовер=\"1\" {issued} {validTo}", expiredHead)).State == PowerOfAttorneyService.CheckState.Error,
+            "POA signed by an expired self-signed head certificate must be rejected");
+        var untrusted = await Poa($"НомДовер=\"1\" {issued} {validTo}", validHead);
+        Assert(untrusted.State == PowerOfAttorneyService.CheckState.Warning && untrusted.Message.Contains("не подтверждены"),
+            "self-signed head certificate must never give Ok: trust and revocation are not established: " + untrusted.Message);
+        Console.WriteLine("fork review: POA without number/issue date and with expired or untrusted self-signed head is not Ok: OK");
     }
 
     // Подменяет алгоритм подписи первого подписанта (значение подписи не меняется).
