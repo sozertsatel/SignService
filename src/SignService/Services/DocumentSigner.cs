@@ -28,6 +28,13 @@ public class DocumentSigner
         /// <summary>Объединять ли с уже существующим файлом .sig (соподписание).</summary>
         public bool MergeWithExisting { get; init; }
 
+        /// <summary>
+        /// Сохранять .bak перед любой перезаписью существующего .sig, в том числе
+        /// при обычном дописывании. Без этого копия создаётся только в рискованных
+        /// случаях: замена без объединения или исключение подписантов.
+        /// </summary>
+        public bool CreateBackup { get; init; }
+
         /// <summary>Пути к .sig других подписантов для объединения.</summary>
         public IReadOnlyList<string> ExtraSignatures { get; init; } = Array.Empty<string>();
 
@@ -257,11 +264,11 @@ public class DocumentSigner
         if (!(await File.ReadAllBytesAsync(targetPath, cancellationToken)).AsSpan().SequenceEqual(data))
             throw new IOException("Документ изменился во время подписания. Подпись не сохранена; повторите операцию.");
         if (poaPackage is not null) PowerOfAttorneyService.CopyPackage(poaPackage, targetPath);
-        // Резервная копия — только когда прежний файл теряет данные: он заменяется без
-        // объединения или из него исключаются подписанты. Дописанная подпись сохраняет
-        // всех прежних подписантов байт в байт, копия тогда не нужна.
+        // Рискованные случаи — всегда: файл заменяется без объединения или из него
+        // исключаются подписанты. Галочка добавляет копию и при обычном дописывании.
         string? backupPath = null;
-        if (File.Exists(signaturePath) && (!appended || excluded.Count > 0))
+        var riskyOverwrite = !appended || excluded.Count > 0;
+        if (File.Exists(signaturePath) && (riskyOverwrite || options.CreateBackup))
             backupPath = SignatureBackup.Create(signaturePath);
         await AtomicFile.WriteAsync(signaturePath, output, overwrite: true, cancellationToken);
 
