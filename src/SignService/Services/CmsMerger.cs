@@ -50,7 +50,8 @@ internal static class CmsMerger
     /// true — результат прикреплённый (с этим документом), false — откреплённый,
     /// null — прикреплённый, если прикреплённым был хотя бы один вход.
     /// </param>
-    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document, bool? attach = null)
+    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document,
+        bool? attach = null, bool throwIfEmpty = true)
     {
         if (signatures.Count == 0)
             throw new ArgumentException("Нет подписей для объединения.", nameof(signatures));
@@ -105,8 +106,12 @@ internal static class CmsMerger
         }
 
         if (parsed.All(p => p.Signers.Count == 0))
+        {
+            if (!throwIfEmpty)
+                return new MergeResult(Array.Empty<byte>(), 0, excluded.Distinct().ToList(), unverified.Distinct().ToList());
             throw new InvalidOperationException(
                 "Все объединяемые подписи повреждены или не соответствуют текущему содержимому документа.");
+        }
 
         if (attachOutput)
         {
@@ -451,6 +456,105 @@ internal static class CmsMerger
         var newSigner = writer.Encode();
         parsed.Signers[0] = (parsed.Signers[0].SidKey, newSigner);
         return BuildMerged(new List<ParsedSignedData> { parsed });
+    }
+
+    /// <summary>
+    /// Копия подписи для проверки, в которой у подписантов ГОСТ из signatureAlgorithm
+    /// убраны параметры ключа, а OID ключа заменён на OID алгоритма подписи. Так пишут
+    /// КриптоПро и CryptoAPI (в том числе SignService на Windows), а BouncyCastle такие
+    /// подписи отклоняет. Поле signatureAlgorithm не входит в подписанные данные, поэтому
+    /// значение подписи, подписанные атрибуты, сертификаты и порядок подписантов
+    /// остаются прежними. null — менять нечего. Результат — только для проверки:
+    /// объединение и запись используют исходные байты подписантов.
+    /// </summary>
+    internal static byte[]? WithoutGostSignatureParameters(byte[] normalizedCms)
+    {
+        try
+        {
+            var contentInfo = new AsnReader(normalizedCms, AsnEncodingRules.BER).ReadSequence();
+            if (contentInfo.ReadObjectIdentifier() != SignedDataOid)
+                return null;
+            var signedData = contentInfo.ReadSequence(new Asn1Tag(TagClass.ContextSpecific, 0)).ReadSequence();
+            var elements = new List<byte[]>();
+            while (signedData.HasData)
+                elements.Add(signedData.ReadEncodedValue().ToArray());
+            if (elements.Count < 4)
+                return null;
+
+            var signerInfos = new AsnReader(elements[^1], AsnEncodingRules.BER).ReadSetOf();
+            var signers = new List<byte[]>();
+            var changed = false;
+            while (signerInfos.HasData)
+            {
+                var der = signerInfos.ReadEncodedValue().ToArray();
+                var rewritten = WithoutGostParameters(der);
+                changed |= rewritten is not null;
+                signers.Add(rewritten ?? der);
+            }
+
+            if (!changed)
+                return null;
+
+            // BER-запись: SET OF не пересортировывается, подписанты сохраняют номера.
+            var writer = new AsnWriter(AsnEncodingRules.BER);
+            using (writer.PushSequence())
+            {
+                writer.WriteObjectIdentifier(SignedDataOid);
+                using (writer.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
+                using (writer.PushSequence())
+                {
+                    foreach (var element in elements.Take(elements.Count - 1))
+                        writer.WriteEncodedValue(element);
+                    using (writer.PushSetOf())
+                    {
+                        foreach (var signer in signers)
+                            writer.WriteEncodedValue(signer);
+                    }
+                }
+            }
+
+            return writer.Encode();
+        }
+        catch (Exception e) when (e is AsnContentException or InvalidOperationException)
+        {
+            return null; // разбор не удался — проверка сообщит о повреждении сама
+        }
+    }
+
+    // signatureAlgorithm подписанта ГОСТ → OID алгоритма подписи без параметров; null — не ГОСТ
+    // или уже в нужном виде. Остальные элементы SignerInfo копируются байт в байт.
+    private static byte[]? WithoutGostParameters(byte[] signerInfoDer)
+    {
+        var elements = SignerElements(signerInfoDer);
+        var signatureIndex = elements.FindIndex(e => e.Tag == new Asn1Tag(UniversalTagNumber.OctetString));
+        if (signatureIndex < 3 || elements[signatureIndex - 1].Tag != Asn1Tag.Sequence)
+            return null;
+
+        var algorithm = new AsnReader(elements[signatureIndex - 1].Der, AsnEncodingRules.BER).ReadSequence();
+        var oid = algorithm.ReadObjectIdentifier();
+        var hasParameters = algorithm.HasData && algorithm.PeekTag() != Asn1Tag.Null;
+        var signatureOid = oid switch
+        {
+            "1.2.643.7.1.1.1.1" or "1.2.643.7.1.1.3.2" => "1.2.643.7.1.1.3.2", // ГОСТ Р 34.10-2012 (256)
+            "1.2.643.7.1.1.1.2" or "1.2.643.7.1.1.3.3" => "1.2.643.7.1.1.3.3", // ГОСТ Р 34.10-2012 (512)
+            "1.2.643.2.2.19" or "1.2.643.2.2.3" => "1.2.643.2.2.3",             // ГОСТ Р 34.10-2001
+            _ => null,
+        };
+        if (signatureOid is null || (!hasParameters && oid == signatureOid))
+            return null;
+
+        var identifier = new AsnWriter(AsnEncodingRules.DER);
+        using (identifier.PushSequence())
+            identifier.WriteObjectIdentifier(signatureOid);
+
+        var writer = new AsnWriter(AsnEncodingRules.DER);
+        using (writer.PushSequence())
+        {
+            for (var i = 0; i < elements.Count; i++)
+                writer.WriteEncodedValue(i == signatureIndex - 1 ? identifier.Encode() : elements[i].Der);
+        }
+
+        return writer.Encode();
     }
 
     // Элементы верхнего уровня SignerInfo в исходном порядке (тег + TLV).

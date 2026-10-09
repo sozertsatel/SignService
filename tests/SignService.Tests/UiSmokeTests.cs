@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
@@ -61,7 +63,7 @@ internal static class UiSmokeTests
         var inspect = items.First(i => i.Header?.ToString()?.StartsWith("Подписанты", StringComparison.Ordinal) == true);
         inspect.Command!.Execute(inspect.CommandParameter);
         Dispatcher.UIThread.RunJobs();
-        Assert(vm.StatusText.Contains("нет файла подписи"), "context menu command must run for the clicked file: " + vm.StatusText);
+        Assert(vm.StatusText.Contains("не найден файл подписи"), "context menu command must run for the clicked file: " + vm.StatusText);
         menu.Close();
 
         var tools = window.GetVisualDescendants().OfType<Button>()
@@ -97,7 +99,48 @@ internal static class UiSmokeTests
         }
 
         window.Close();
-        Console.WriteLine("ui: main window, file context menu (bound, runs for the file), tools menu, 7 dialogs: OK");
+        CheckCoSignRow(tempRoot);
+        Console.WriteLine("ui: main window, file context menu (bound, runs for the file), tools menu, 7 dialogs, co-sign row: OK");
+    }
+
+    // Строка очереди с найденной подписью: выбор режима, план и предупреждение отображаются;
+    // поиск подписей идёт в фоне, его результат применяется в потоке интерфейса.
+    private static void CheckCoSignRow(string tempRoot)
+    {
+        var dir = Path.Combine(tempRoot, "ui_cosign");
+        Directory.CreateDirectory(dir);
+        var document = Path.Combine(dir, "договор.pdf");
+        File.WriteAllBytes(document, "%PDF-1.4 договор"u8.ToArray());
+        using var key = RSA.Create(2048);
+        using var cert = new CertificateRequest("CN=Подписант А", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
+            .CreateSelfSigned(DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddYears(1));
+        var signer = new DocumentSigner();
+        File.WriteAllBytes(Path.Combine(dir, "договор-.pdf .sig"), signer.Sign(File.ReadAllBytes(document), cert));
+
+        var settings = new AppSettings(Path.Combine(dir, "settings")) { CheckUpdatesOnStart = false };
+        var vm = new MainWindowViewModel(new CertificateProvider(), signer, settings, new CertificateVault(Path.Combine(dir, "vault")));
+        var window = new MainWindow { DataContext = vm };
+        window.Show();
+        var adding = vm.AddFilesAsync(document);
+        for (var i = 0; !adding.IsCompleted && i < 3000; i++)
+        {
+            Dispatcher.UIThread.RunJobs();
+            Thread.Sleep(10);
+        }
+        Dispatcher.UIThread.RunJobs();
+        Assert(adding.IsCompletedSuccessfully, "signature search must finish");
+
+        var combo = window.GetVisualDescendants().OfType<ComboBox>().Single(box => box.ItemsSource == vm.Files[0].CoSignOptions);
+        Assert(combo.ItemCount == 2 && combo.IsEnabled && combo.SelectedItem is CoSignOption { CreateNew: false },
+            "co-sign choice must list the found signature and «create new»");
+        var texts = window.GetVisualDescendants().OfType<TextBlock>().Select(text => text.Text ?? "").ToList();
+        Assert(texts.Any(text => text.Contains("будет добавлена подпись №2")), "plan line must be shown");
+        vm.IsBusy = true;
+        Dispatcher.UIThread.RunJobs();
+        Assert(!combo.IsEnabled, "co-sign choice must be locked while signing");
+        vm.IsBusy = false;
+        Assert(window.CaptureRenderedFrame() is not null, "co-sign row must render");
+        window.Close();
     }
 
     private static void Assert(bool value, string message)

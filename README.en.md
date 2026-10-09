@@ -38,13 +38,22 @@ is published on the [Releases](https://github.com/zaynullinmi/SignService/releas
 ### Co-signing and verification
 
 - other people's signatures are **merged with yours into a single `.sig`**
-  with multiple signers: automatically with an existing `name.sig` next to the
-  document (can be turned off), via the "＋.sig" button, or by dropping
-  a signature file onto the window;
+  with multiple signers: the app finds a document's signatures in its folder
+  **by content** — the signature file name may be anything
+  ("договор-.pdf .sig", `.p7s`, `.p7m`); each file offers "Add to 'X.sig'
+  (8 signers)" or "Create new", and a plan line shows what will happen
+  ("signature No. 9 will be added to …"); the "Add to existing signature /
+  Create new" switch sets the default. Signatures from other folders are
+  attached with the "＋.sig" button or by dropping them — to their document
+  by content;
+- before replacing a signature file without merging and before excluding
+  signers the app asks for confirmation and keeps a backup next to it; the
+  result shows in the file row: "Подписан: 9 (8 + ваша) → X.sig";
 - re-signing with the same certificate **replaces** your previous signature
   instead of duplicating it;
 - every merged signature is **cryptographically verified**, including the
-  document digest, signature value and CAdES certificate binding. Damaged
+  document digest, signature value and CAdES certificate binding — CryptoPro
+  signatures with GOST parameters in signatureAlgorithm included. Damaged
   signatures and signatures over another revision are excluded; signers that
   cannot be verified (unknown algorithm, missing certificate) are kept and
   explicitly reported;
@@ -66,6 +75,8 @@ The operations are available in the **Tools** menu (pick files) and in the
   Copy or export the detailed report to TXT;
 - **Merge .sig…** — combine several signature files into one containing all
   signers (attached containers are accepted; the embedded document is kept);
+  when the document is known (by name or found by content) the result is
+  `document.sig`, an existing file is never overwritten;
 - **Extract from .sig…** — pull out of a container: the embedded document
   (byte-exact), a detached signature with all signers, and individual `.sig`
   files per signer (signer names in the file names);
@@ -206,8 +217,10 @@ dotnet publish src/SignService -c Release -r win-x64 --self-contained true \
 ## Usage
 
 1. Start the app — certificates with a private key appear in the drop-down.
-2. Pick a certificate and the signature mode; optionally enable the PDF stamp
-   (a dialog asks for its parameters); the timestamp is set up in **Settings…**.
+2. Pick a certificate, the signature mode and "Add to existing signature" or
+   "Create new"; each file shows which signature yours will be added to.
+   Optionally enable the PDF stamp (a dialog asks for its parameters); the
+   timestamp is set up in **Settings…**.
 3. Drag files into the window (or use the browser) and press **Sign** —
    a `name.sig` appears next to each file.
 4. Operations on existing signatures live in the **Tools** menu and in the
@@ -236,6 +249,7 @@ src/SignService/
 │   ├── Streebog.cs              # GOST R 34.11-2012 for certHash (RFC 6986 vectors)
 │   ├── CmsMerger.cs             # ASN.1-level merge/split/build of signatures
 │   ├── CmsExtractor.cs          # file operations: extract, merge, split, container
+│   ├── SignatureDiscovery.cs    # finding a document's signatures by content
 │   ├── SignatureVerifier.cs     # per-signer verification (BouncyCastle, GOST without a CSP)
 │   ├── CertificateValidator.cs  # trust chain (PKIX) and OS stores
 │   ├── RevocationChecker.cs     # certificate revocation: CRL and OCSP
