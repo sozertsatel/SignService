@@ -50,7 +50,8 @@ internal static class CmsMerger
     /// true — результат прикреплённый (с этим документом), false — откреплённый,
     /// null — прикреплённый, если прикреплённым был хотя бы один вход.
     /// </param>
-    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document, bool? attach = null)
+    public static MergeResult MergeForDocument(IReadOnlyList<byte[]> signatures, byte[] document,
+        bool? attach = null, bool throwIfEmpty = true)
     {
         if (signatures.Count == 0)
             throw new ArgumentException("Нет подписей для объединения.", nameof(signatures));
@@ -105,8 +106,12 @@ internal static class CmsMerger
         }
 
         if (parsed.All(p => p.Signers.Count == 0))
+        {
+            if (!throwIfEmpty)
+                return new MergeResult(Array.Empty<byte>(), 0, excluded.Distinct().ToList(), unverified.Distinct().ToList());
             throw new InvalidOperationException(
                 "Все объединяемые подписи повреждены или не соответствуют текущему содержимому документа.");
+        }
 
         if (attachOutput)
         {

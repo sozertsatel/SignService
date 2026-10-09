@@ -132,6 +132,14 @@ public static class SignatureVerifier
                     ? VerificationCheck.Valid("Значение подписи проверено открытым ключом сертификата.")
                     : VerificationCheck.Invalid("Значение подписи неверно: подпись повреждена или подделана.");
             }
+            // КриптоПро записывает в signatureAlgorithm параметры ГОСТ (SEQUENCE из OID
+            // набора параметров и алгоритма хеша). BouncyCastle с 2.6 отклоняет любые
+            // параметры, которые ему неизвестны, хотя сама подпись считается по
+            // подписанным атрибутам, а набор параметров берётся из открытого ключа.
+            catch (Exception e) when (IsUnrecognisedSignatureParameters(e))
+            {
+                signatureCheck = VerifyGostDespiteParameters(signer, cert.GetPublicKey(), documentCheck, e);
+            }
             catch (Exception e) when (UnsupportedAlgorithm(e)) { signatureCheck = VerificationCheck.Unknown("Алгоритм не поддерживается: " + e.Message); }
             // Хеш документа не совпал — подпись относится к другому содержимому.
             catch (Exception) when (documentCheck.State == VerificationState.Invalid)
@@ -291,6 +299,65 @@ public static class SignatureVerifier
         "2.16.840.1.101.3.4.2.1" => "SHA-256", "2.16.840.1.101.3.4.2.2" => "SHA-384",
         "2.16.840.1.101.3.4.2.3" => "SHA-512", "1.3.14.3.2.26" => "SHA-1", _ => oid,
     };
+
+    /// <summary>
+    /// Проверка ГОСТ, когда в signatureAlgorithm есть параметры и штатный
+    /// <c>SignerInformation.Verify</c> из-за них отказывается работать.
+    /// Подпись проверяется тем же ГОСТ Р 34.10 по подписанным атрибутам и ключу сертификата.
+    /// </summary>
+    private static VerificationCheck VerifyGostDespiteParameters(SignerInformation signer,
+        Org.BouncyCastle.Crypto.AsymmetricKeyParameter key, VerificationCheck documentCheck, Exception error)
+    {
+        if (documentCheck.State == VerificationState.Invalid)
+            return VerificationCheck.Invalid("Подпись не соответствует документу: " + documentCheck.Message);
+
+        var mechanism = GostSignerName(signer.DigestAlgorithmID.Algorithm.Id, signer.SignatureAlgorithm.Algorithm.Id);
+        if (mechanism is null)
+            return VerificationCheck.Unknown("Подпись не удалось проверить: " + error.Message);
+        try
+        {
+            var attributes = signer.GetEncodedSignedAttributes();
+            if (attributes is null)
+                return VerificationCheck.Unknown("Подпись не удалось проверить: " + error.Message);
+            var verifier = SignerUtilities.GetSigner(mechanism);
+            verifier.Init(false, key);
+            verifier.BlockUpdate(attributes, 0, attributes.Length);
+            return verifier.VerifySignature(signer.GetSignature())
+                ? VerificationCheck.Valid("Значение подписи проверено открытым ключом сертификата.")
+                : VerificationCheck.Invalid("Значение подписи неверно: подпись повреждена или подделана.");
+        }
+        catch (Exception e) when (UnsupportedAlgorithm(e))
+        {
+            return VerificationCheck.Unknown("Алгоритм не поддерживается: " + e.Message);
+        }
+        catch (Exception e)
+        {
+            return VerificationCheck.Unknown("Подпись не удалось проверить: " + e.Message);
+        }
+    }
+
+    /// <summary>Имя механизма BouncyCastle для пары «хеш ГОСТ + подпись ГОСТ».</summary>
+    private static string? GostSignerName(string digestOid, string signatureOid) => signatureOid switch
+    {
+        "1.2.643.7.1.1.3.2" => "GOST3411-2012-256WITHECGOST3410-2012-256",
+        "1.2.643.7.1.1.3.3" => "GOST3411-2012-512WITHECGOST3410-2012-512",
+        "1.2.643.2.2.3" => "GOST3411WITHECGOST3410",
+        _ => (digestOid, signatureOid) switch
+        {
+            ("1.2.643.7.1.1.2.2", "1.2.643.7.1.1.1.1") => "GOST3411-2012-256withECGOST3410-2012-256",
+            ("1.2.643.7.1.1.2.3", "1.2.643.7.1.1.1.2") => "GOST3411-2012-512withECGOST3410-2012-512",
+            ("1.2.643.2.2.9", "1.2.643.2.2.19") => "GOST3411withECGOST3410",
+            _ => null,
+        },
+    };
+
+    private static bool IsUnrecognisedSignatureParameters(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+            if (current.Message.Contains("unrecognised signature parameters", StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
 
     private static bool UnsupportedAlgorithm(Exception exception)
     {
