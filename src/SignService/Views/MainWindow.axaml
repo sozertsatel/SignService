@@ -279,12 +279,8 @@
 
         <!-- Лог операций (всегда виден) -->
         <Grid Grid.Row="6" RowDefinitions="Auto,Auto" Margin="0,8,0,0">
-            <Grid Grid.Row="0" ColumnDefinitions="*,Auto">
-                <TextBlock Grid.Column="0" Text="Лог операций" FontWeight="SemiBold"
-                           VerticalAlignment="Center"/>
-                <Button Grid.Column="1" Content="Очистить" Padding="8,2"
-                        Command="{Binding ClearLogCommand}"/>
-            </Grid>
+            <TextBlock Grid.Row="0" Text="Лог операций" FontWeight="SemiBold"
+                       VerticalAlignment="Center"/>
             <TextBox Grid.Row="1" Name="LogBox" Margin="0,4,0,0"
                      Text="{Binding LogText, Mode=OneWay}"
                      IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
@@ -292,16 +288,19 @@
                      Height="120"/>
         </Grid>
 
-        <!-- Нижняя строка: версия и служебные окна -->
-        <Grid Grid.Row="7" ColumnDefinitions="*,Auto,Auto" Margin="0,10,0,0">
-            <TextBlock Grid.Column="0" Margin="0,0,8,0" VerticalAlignment="Center"
+        <!-- Нижняя строка: очистка лога слева, версия, настройки -->
+        <Grid Grid.Row="7" ColumnDefinitions="Auto,*,Auto,Auto" Margin="0,10,0,0">
+            <Button Grid.Column="0" Content="Очистить лог" Padding="8,2" Margin="0,0,12,0"
+                    Command="{Binding ClearLogCommand}"
+                    ToolTip.Tip="Стирает только текст лога операций. Список файлов не очищается."/>
+            <TextBlock Grid.Column="1" Margin="0,0,8,0" VerticalAlignment="Center"
                        Text="{Binding VersionDisplay}"
                        TextTrimming="CharacterEllipsis"
                        Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-            <Button Grid.Column="1" Name="SettingsButton" Padding="8,2" Margin="0,0,8,0"
+            <Button Grid.Column="2" Name="SettingsButton" Padding="8,2" Margin="0,0,8,0"
                     Content="Настройки…"
                     ToolTip.Tip="Резервная копия .sig, штамп времени (CAdES-T) и адрес службы TSA"/>
-            <Button Grid.Column="2" Name="AboutButton" Padding="8,2" Content="О программе"
+            <Button Grid.Column="3" Name="AboutButton" Padding="8,2" Content="О программе"
                     ToolTip.Tip="Версия, автор, история версий и обновления"/>
         </Grid>
     </Grid>
